@@ -44,3 +44,39 @@ if _is_enabled("VISIBLE_ADJACENT_LANE_VEHICLE"):
 
             AdjacentLaneVehicle._initialize_actors = _initialize_actors_visible
             AdjacentLaneVehicle._visible_spawn_patch = True
+
+
+try:
+    from srunner.scenarios.route_obstacles import ParkedObstacle
+    from srunner.scenarios.route_obstacles import get_value_parameter as _get_route_obstacle_value
+except Exception:
+    # If the scenario runner is not available in the current process, skip the patch.
+    pass
+else:
+    if not getattr(ParkedObstacle, "_xml_end_distance_patch", False):
+        _parked_obstacle_original_init = ParkedObstacle.__init__
+
+        def _parked_obstacle_init_with_end_distance(
+            self,
+            world,
+            ego_vehicles,
+            config,
+            randomize=False,
+            debug_mode=False,
+            criteria_enable=True,
+            timeout=180,
+        ):
+            _parked_obstacle_original_init(
+                self,
+                world,
+                ego_vehicles,
+                config,
+                randomize,
+                debug_mode,
+                criteria_enable,
+                timeout,
+            )
+            self._end_distance = _get_route_obstacle_value(config, "end_distance", float, self._end_distance)
+
+        ParkedObstacle.__init__ = _parked_obstacle_init_with_end_distance
+        ParkedObstacle._xml_end_distance_patch = True
