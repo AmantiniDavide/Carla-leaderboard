@@ -1,7 +1,5 @@
-import copy
 import logging
 import numpy as np
-import os
 import time
 from threading import Thread
 
@@ -155,21 +153,18 @@ class CallBack(object):
 
     # Parsing CARLA physical Sensors
     def _parse_image_cb(self, image, tag):
-        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-        array = copy.deepcopy(array)
+        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8")).copy()
         array = np.reshape(array, (image.height, image.width, 4))
         self._data_provider.update_sensor(tag, array, image.frame)
 
     def _parse_lidar_cb(self, lidar_data, tag):
-        points = np.frombuffer(lidar_data.raw_data, dtype=np.dtype('f4'))
-        points = copy.deepcopy(points)
+        points = np.frombuffer(lidar_data.raw_data, dtype=np.dtype('f4')).copy()
         points = np.reshape(points, (int(points.shape[0] / 4), 4))
         self._data_provider.update_sensor(tag, points, lidar_data.frame)
 
     def _parse_radar_cb(self, radar_data, tag):
         # [depth, azimuth, altitute, velocity]
-        points = np.frombuffer(radar_data.raw_data, dtype=np.dtype('f4'))
-        points = copy.deepcopy(points)
+        points = np.frombuffer(radar_data.raw_data, dtype=np.dtype('f4')).copy()
         points = np.reshape(points, (int(points.shape[0] / 4), 4))
         points = np.flip(points, 1)
         self._data_provider.update_sensor(tag, points, radar_data.frame)

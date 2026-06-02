@@ -25,6 +25,7 @@ from leaderboard.autoagents.ros_base_agent import ROSBaseAgent
 MAX_ALLOWED_RADIUS_SENSOR = 3.0
 QUALIFIER_SENSORS_LIMITS = {
     'sensor.camera.rgb': 4,
+    'sensor.camera.depth': 4,
     'sensor.lidar.ray_cast': 1,
     'sensor.other.radar': 2,
     'sensor.other.gnss': 1,
@@ -34,6 +35,7 @@ QUALIFIER_SENSORS_LIMITS = {
 }
 SENSORS_LIMITS = {
     'sensor.camera.rgb': 8,
+    'sensor.camera.depth': 8,
     'sensor.lidar.ray_cast': 2,
     'sensor.other.radar': 4,
     'sensor.other.gnss': 1,
@@ -154,7 +156,7 @@ class AgentWrapper(object):
             sensor_location = carla.Location()
             sensor_rotation = carla.Rotation()
 
-        if type_ == 'sensor.camera.rgb':
+        if type_ in ('sensor.camera.rgb', 'sensor.camera.depth'):
             attributes['image_size_x'] = str(sensor_spec['width'])
             attributes['image_size_y'] = str(sensor_spec['height'])
             attributes['fov'] = str(sensor_spec['fov'])
@@ -187,7 +189,7 @@ class AgentWrapper(object):
             attributes['horizontal_fov'] = str(sensor_spec['horizontal_fov'])  # degrees
             attributes['vertical_fov'] = str(sensor_spec['vertical_fov'])  # degrees
             attributes['points_per_second'] = '1500'
-            attributes['range'] = '100'  # meters
+            attributes['range'] = '30'  # meters
 
             sensor_location = carla.Location(x=sensor_spec['x'],
                                              y=sensor_spec['y'],
