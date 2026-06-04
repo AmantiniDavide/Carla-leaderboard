@@ -239,6 +239,12 @@ class MyAgent(AutonomousAgent):
         self._front_radar_resume_distance = 12.0
         self._front_radar_min_points = 2
         self._front_radar_max_mean_abs_azimuth = np.deg2rad(4.0)
+        self._rejoin_radar_max_depth = 18.0
+        self._rejoin_radar_max_abs_azimuth = np.deg2rad(35.0)
+        self._rejoin_radar_min_forward_distance = 1.5
+        self._rejoin_radar_min_points = 2
+        self._rejoin_lane_lateral_margin = 1.5
+        self._rejoin_clear_hold_time = 0.4
         self._front_vehicle_min_confidence = 0.45
         self._front_vehicle_center_x_min = 0.30
         self._front_vehicle_center_x_max = 0.70
@@ -249,7 +255,9 @@ class MyAgent(AutonomousAgent):
         self._left_oncoming_min_area_ratio = 0.0025
         self._left_oncoming_min_center_x_ratio = 0.15
         self._left_oncoming_max_center_x_ratio = 0.90
-        self._sensor_stop_brake = 0.60
+        self._sensor_soft_brake = 0.18
+        self._sensor_stop_brake = 0.38
+        self._sensor_close_brake = 0.62
         self._sensor_emergency_brake = 0.95
         self._overtake_fail_safe_distance = 6.0
         self._overtake_fail_safe_velocity = -2.0
@@ -276,6 +284,7 @@ class MyAgent(AutonomousAgent):
         self._using_helper_rejoin_plan = False
         self._saved_route_plan = []
         self._waiting_left_reason = "clear"
+        self._rejoin_lane_clear_since = None
         self._last_leftcam_filter_debug_timestamp = -1.0
         self._last_overtake_fail_safe_log_timestamp = -1.0
 
@@ -363,7 +372,10 @@ class MyAgent(AutonomousAgent):
         raw_rear_radar_points = rear_radar[1] if rear_radar is not None else None
         front_radar_points = self._extract_front_cluster(raw_front_radar_points)
         rear_radar_points = self._extract_rear_cluster(raw_rear_radar_points)
-        front_vehicle_state = self._estimate_front_vehicle_state(front_radar_points)
+        front_vehicle_state = self._estimate_front_vehicle_state(
+            front_radar_points,
+            raw_front_radar_points,
+        )
         should_check_overtake = (
             front_vehicle_state["blocked"]
             or self._overtake_state != "follow_lane"
@@ -531,16 +543,37 @@ class MyAgent(AutonomousAgent):
 
         return front_radar_depth <= self._front_radar_resume_distance
 
+    def _compute_front_obstacle_brake(self, front_vehicle_state):
+        if front_vehicle_state is None:
+            return self._sensor_stop_brake
+
+        front_radar_depth = front_vehicle_state.get("front_radar_depth")
+        if front_radar_depth is None:
+            return self._sensor_stop_brake
+
+        if front_radar_depth <= self._front_vehicle_emergency_distance:
+            return self._sensor_close_brake
+
+        trigger_distance = max(
+            self._front_radar_trigger_distance,
+            self._front_vehicle_emergency_distance + 0.1,
+        )
+        distance_span = max(trigger_distance - self._front_vehicle_emergency_distance, 0.1)
+        closeness = (trigger_distance - front_radar_depth) / distance_span
+        closeness = float(np.clip(closeness, 0.0, 1.0))
+
+        return self._sensor_soft_brake + closeness * (self._sensor_stop_brake - self._sensor_soft_brake)
+
     def _apply_sensor_navigation(self, control, current_waypoint, front_vehicle_state, left_oncoming):
         if self._overtake_state in ("follow_lane", "waiting_left"):
             if self._is_front_obstacle_active(front_vehicle_state):
-                brake_value = self._sensor_emergency_brake if front_vehicle_state["emergency"] else self._sensor_stop_brake
+                brake_value = self._compute_front_obstacle_brake(front_vehicle_state)
                 return self._apply_brake_override(control, brake_value)
 
         if self._overtake_state == "changing_left" and current_waypoint is not None:
             if self._overtake_origin_lane_id is not None and current_waypoint.lane_id == self._overtake_origin_lane_id:
                 if front_vehicle_state["distance_m"] is not None and front_vehicle_state["distance_m"] < self._front_vehicle_emergency_distance:
-                    return self._apply_brake_override(control, self._sensor_stop_brake)
+                    return self._apply_brake_override(control, self._sensor_close_brake)
 
         if self._overtake_state in ("changing_left", "passing"):
             if left_oncoming is not None:
@@ -609,16 +642,19 @@ class MyAgent(AutonomousAgent):
                 self._overtake_state = "follow_lane"
 
         elif self._overtake_state == "changing_left":
+            self._rejoin_lane_clear_since = None
             if current_waypoint is not None and self._overtake_origin_lane_id is not None:
                 if current_waypoint.lane_id != self._overtake_origin_lane_id:
                     self._overtake_state = "passing"
                     self._left_lane_entered_at = timestamp
 
         elif self._overtake_state == "passing":
+            self._update_rejoin_clear_state(current_waypoint, front_vehicle_state, timestamp)
             if self._should_return_right(current_waypoint, front_vehicle_state, timestamp):
                 self._start_lane_change(current_waypoint, "right", timestamp)
 
         elif self._overtake_state == "changing_right":
+            self._rejoin_lane_clear_since = None
             if current_waypoint is not None and self._overtake_origin_lane_id is not None:
                 if current_waypoint.lane_id == self._overtake_origin_lane_id:
                     self._right_lane_entered_at = (
@@ -691,6 +727,7 @@ class MyAgent(AutonomousAgent):
             self._left_lane_entered_at = None
             self._right_lane_entered_at = None
             self._using_helper_rejoin_plan = False
+            self._rejoin_lane_clear_since = None
             self._overtake_state = "changing_left"
             self._agent.set_global_plan(plan)
             self._agent.set_target_speed(self._overtake_speed)
@@ -744,6 +781,7 @@ class MyAgent(AutonomousAgent):
             self._overtake_state = "changing_right"
             self._right_lane_entered_at = None
             self._using_helper_rejoin_plan = using_helper_rejoin_plan
+            self._rejoin_lane_clear_since = None
             self._agent.set_global_plan(plan)
             self._agent.set_target_speed(self._overtake_speed)
             return True
@@ -751,11 +789,14 @@ class MyAgent(AutonomousAgent):
         return False
 
     def _should_return_right(self, current_waypoint, front_vehicle_state, timestamp):
+        del front_vehicle_state
         if current_waypoint is None:
             return False
         if self._left_lane_entered_at is None or timestamp - self._left_lane_entered_at < self._min_left_lane_time:
             return False
-        if front_vehicle_state["distance_m"] is not None and front_vehicle_state["distance_m"] < self._front_vehicle_resume_distance:
+        if self._rejoin_lane_clear_since is None:
+            return False
+        if timestamp - self._rejoin_lane_clear_since < self._rejoin_clear_hold_time:
             return False
 
         rejoin_waypoint, _rejoin_direction = self._find_origin_adjacent_lane(current_waypoint)
@@ -763,6 +804,29 @@ class MyAgent(AutonomousAgent):
             return False
 
         return True
+
+    def _update_rejoin_clear_state(self, current_waypoint, front_vehicle_state, timestamp):
+        if self._is_rejoin_lane_clear(current_waypoint, front_vehicle_state):
+            if self._rejoin_lane_clear_since is None:
+                self._rejoin_lane_clear_since = timestamp
+        else:
+            self._rejoin_lane_clear_since = None
+
+    def _is_rejoin_lane_clear(self, current_waypoint, front_vehicle_state):
+        if current_waypoint is None or front_vehicle_state is None:
+            return False
+
+        rejoin_waypoint, _rejoin_direction = self._find_origin_adjacent_lane(current_waypoint)
+        if rejoin_waypoint is None:
+            return False
+
+        raw_front_radar_points = front_vehicle_state.get("raw_front_radar_points")
+        rejoin_lane_points = self._extract_rejoin_lane_radar_points(
+            current_waypoint,
+            rejoin_waypoint,
+            raw_front_radar_points,
+        )
+        return len(rejoin_lane_points) < self._rejoin_radar_min_points
 
     def _finish_overtake(self, current_waypoint, timestamp):
         using_helper_rejoin_plan = self._using_helper_rejoin_plan
@@ -776,6 +840,7 @@ class MyAgent(AutonomousAgent):
         self._overtake_origin_road_id = None
         self._using_helper_rejoin_plan = False
         self._waiting_left_reason = "clear"
+        self._rejoin_lane_clear_since = None
 
         if self._agent is not None:
             self._agent.set_target_speed(self._target_speed)
@@ -892,6 +957,62 @@ class MyAgent(AutonomousAgent):
             return self._get_adjacent_driving_lane(route_waypoint, "right")
 
         return None
+
+    def _extract_rejoin_lane_radar_points(self, current_waypoint, rejoin_waypoint, raw_front_radar_points):
+        if current_waypoint is None or rejoin_waypoint is None:
+            return np.empty((0, 4), dtype=np.float32)
+        if raw_front_radar_points is None or len(raw_front_radar_points) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+
+        filtered_points = self._filter_radar_points(
+            raw_front_radar_points,
+            min_depth=self._front_radar_min_depth,
+            max_depth=self._rejoin_radar_max_depth,
+            max_abs_azimuth=self._rejoin_radar_max_abs_azimuth,
+        )
+        if filtered_points is None or len(filtered_points) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+
+        hero_actor = self._hero_actor or self._get_hero_actor()
+        if hero_actor is not None:
+            ego_transform = hero_actor.get_transform()
+            current_location = ego_transform.location
+            right_vector = ego_transform.get_right_vector()
+        else:
+            current_location = current_waypoint.transform.location
+            right_vector = current_waypoint.transform.get_right_vector()
+
+        rejoin_location = rejoin_waypoint.transform.location
+        lane_center_lateral = (
+            right_vector.x * (rejoin_location.x - current_location.x)
+            + right_vector.y * (rejoin_location.y - current_location.y)
+            + right_vector.z * (rejoin_location.z - current_location.z)
+        )
+        lane_width = float(
+            rejoin_waypoint.lane_width
+            if getattr(rejoin_waypoint, "lane_width", None) is not None
+            else current_waypoint.lane_width
+        )
+        lateral_margin = max(self._rejoin_lane_lateral_margin, 0.45 * lane_width)
+
+        lane_points = []
+        for point in filtered_points:
+            depth = float(point[0])
+            azimuth = float(point[2])
+            forward_m = depth * np.cos(azimuth)
+            lateral_m = depth * np.sin(azimuth)
+
+            if forward_m < self._rejoin_radar_min_forward_distance:
+                continue
+            if abs(lateral_m - lane_center_lateral) > lateral_margin:
+                continue
+
+            lane_points.append(point)
+
+        if not lane_points:
+            return np.empty((0, 4), dtype=np.float32)
+
+        return np.asarray(lane_points, dtype=filtered_points.dtype)
 
     def _build_lane_shift_plan_from_saved_route(self, current_waypoint, segments):
         if current_waypoint is None or not self._saved_route_plan:
@@ -1185,7 +1306,7 @@ class MyAgent(AutonomousAgent):
         )
         return candidates[0][0]
 
-    def _estimate_front_vehicle_state(self, front_radar_points):
+    def _estimate_front_vehicle_state(self, front_radar_points, raw_front_radar_points=None):
         front_radar_depth = None
         front_radar_velocity = None
         front_radar_count = 0
@@ -1216,6 +1337,7 @@ class MyAgent(AutonomousAgent):
             "front_radar_velocity": front_radar_velocity,
             "front_radar_count": front_radar_count,
             "front_radar_mean_abs_azimuth": front_radar_mean_abs_azimuth,
+            "raw_front_radar_points": raw_front_radar_points,
         }
 
     def _detect_left_oncoming_vehicle(self, detections):
