@@ -122,7 +122,7 @@ class CameraDisplay(object):
             label_y = max(rect.y - label_surface.get_height() - 2, 0)
             self._display.blit(label_surface, (rect.x, label_y))
 
-    def render(self, center_image=None, left_image=None, left_rear_image=None, speed_mps=None,
+    def render(self, center_image=None, left_image=None, speed_mps=None,
                detections=None,
                navigation_state=None,
                front_radar=None, rear_radar=None):
@@ -135,8 +135,6 @@ class CameraDisplay(object):
             self._surface = self._image_to_surface(center_image)
         elif left_image is not None:
             self._surface = self._image_to_surface(left_image)
-        elif left_rear_image is not None:
-            self._surface = self._image_to_surface(left_rear_image)
         else:
             self._surface = None
 
@@ -161,17 +159,7 @@ class CameraDisplay(object):
             self._display.blit(left_surface, inset_rect.topleft)
             self._draw_text_lines(["LeftCam"], (inset_rect.x + 8, inset_rect.y + 8), self._small_font)
 
-        if center_image is not None and left_rear_image is not None:
-            left_rear_surface = pygame.transform.smoothscale(
-                self._image_to_surface(left_rear_image),
-                (inset_width, inset_height),
-            )
-            rear_inset_rect = pygame.Rect(20, 40 + inset_height, inset_width, inset_height)
-            pygame.draw.rect(self._display, (0, 0, 0), rear_inset_rect.inflate(6, 6))
-            self._display.blit(left_rear_surface, rear_inset_rect.topleft)
-            self._draw_text_lines(["LeftRearCam"], (rear_inset_rect.x + 8, rear_inset_rect.y + 8), self._small_font)
-
-        info_lines = ["Center RGB + side cameras active"]
+        info_lines = ["Center RGB + LeftCam active"]
         if speed_mps is None:
             info_lines.append("Speed: unavailable")
         else:
@@ -258,11 +246,13 @@ class MyAgent(AutonomousAgent):
         self._rear_approach_distance = 18.0
         self._rear_approach_velocity = -2.0
         self._left_oncoming_min_confidence = 0.45
-        self._left_oncoming_min_area_ratio = 0.015
+        self._left_oncoming_min_area_ratio = 0.0025
         self._left_oncoming_min_center_x_ratio = 0.15
-        self._left_oncoming_max_center_x_ratio = 0.72
+        self._left_oncoming_max_center_x_ratio = 0.90
         self._sensor_stop_brake = 0.60
         self._sensor_emergency_brake = 0.95
+        self._overtake_fail_safe_distance = 6.0
+        self._overtake_fail_safe_velocity = -2.0
         self._blocked_hold_time = 1.0
         self._overtake_speed = min(max(self._target_speed, 15.0), 25.0)
         self._overtake_same_lane_distance = 2.0
@@ -286,6 +276,8 @@ class MyAgent(AutonomousAgent):
         self._using_helper_rejoin_plan = False
         self._saved_route_plan = []
         self._waiting_left_reason = "clear"
+        self._last_leftcam_filter_debug_timestamp = -1.0
+        self._last_overtake_fail_safe_log_timestamp = -1.0
 
         if path_to_conf_file:
             self._load_config(path_to_conf_file)
@@ -320,24 +312,11 @@ class MyAgent(AutonomousAgent):
                 "z": 1.60,
                 "roll": 0.0,
                 "pitch": 0.0,
-                "yaw": 0.0,
+                "yaw": -45,
                 "width": self.camera_width,
                 "height": self.camera_height,
                 "fov": 100,
                 "id": "LeftCam",
-            },
-            {
-               "type": "sensor.camera.rgb",
-                "x": -0.7,
-                "y": -1.5,
-                "z": 1.60,
-                "roll": 0.0,
-                "pitch": 0.0,
-                "yaw": 180.0,
-                "width": self.camera_width,
-                "height": self.camera_height,
-                "fov": 100,
-                "id": "LeftRearCam",
             },
             {
                "type": "sensor.other.radar",
@@ -371,7 +350,6 @@ class MyAgent(AutonomousAgent):
         """
         self._current_timestamp = timestamp
         left_camera = input_data.get("LeftCam")
-        left_rear_camera = input_data.get("LeftRearCam")
         center_camera = input_data.get("Center")
         speed_data = input_data.get("Speed")
         front_radar = input_data.get("FrontRdr")
@@ -379,7 +357,6 @@ class MyAgent(AutonomousAgent):
 
         center_image = center_camera[1] if center_camera is not None else None
         left_image = left_camera[1] if left_camera is not None else None
-        left_rear_image = left_rear_camera[1] if left_rear_camera is not None else None
         yolo_detections = []
         speed_mps = speed_data[1]["speed"] if speed_data is not None else None
         raw_front_radar_points = front_radar[1] if front_radar is not None else None
@@ -387,7 +364,14 @@ class MyAgent(AutonomousAgent):
         front_radar_points = self._extract_front_cluster(raw_front_radar_points)
         rear_radar_points = self._extract_rear_cluster(raw_rear_radar_points)
         front_vehicle_state = self._estimate_front_vehicle_state(front_radar_points)
-        should_check_overtake = front_vehicle_state["blocked"] or self._overtake_state != "follow_lane"
+        should_check_overtake = (
+            front_vehicle_state["blocked"]
+            or self._overtake_state != "follow_lane"
+            or (
+                front_vehicle_state["front_radar_depth"] is not None
+                and front_vehicle_state["front_radar_depth"] <= self._front_vehicle_block_distance
+            )
+        )
         left_yolo_detections = self._run_yolo(left_image) if should_check_overtake else []
         left_oncoming = self._detect_left_oncoming_vehicle(left_yolo_detections)
         rear_approaching = self._detect_rear_approaching_vehicle(rear_radar_points)
@@ -399,7 +383,6 @@ class MyAgent(AutonomousAgent):
             left_oncoming,
             rear_approaching,
             left_image,
-            left_rear_image,
             speed_data[1] if speed_data is not None else None,
             raw_front_radar_points,
             raw_rear_radar_points,
@@ -443,11 +426,11 @@ class MyAgent(AutonomousAgent):
             control,
             current_waypoint,
             front_vehicle_state,
+            left_oncoming,
         )
         self._display.render(
             center_image=center_image,
             left_image=left_image,
-            left_rear_image=left_rear_image,
             speed_mps=speed_mps,
             detections=[],
             navigation_state=self._overtake_state,
@@ -460,7 +443,7 @@ class MyAgent(AutonomousAgent):
                              front_vehicle_state,
                              left_oncoming,
                              rear_approaching,
-                             left_image, left_rear_image, speed_data,
+                             left_image, speed_data,
                              front_radar_points, rear_radar_points):
         if self._sensor_snapshot_logged:
             return
@@ -479,8 +462,6 @@ class MyAgent(AutonomousAgent):
                 rear_approaching["distance_m"], rear_approaching["velocity_mps"]))
         if left_image is not None:
             print("[Sensors] LeftCam image shape={} dtype={}".format(left_image.shape, left_image.dtype))
-        if left_rear_image is not None:
-            print("[Sensors] LeftRearCam image shape={} dtype={}".format(left_rear_image.shape, left_rear_image.dtype))
         if speed_data is not None:
             print("[Sensors] Speed payload={}".format(speed_data))
         if front_radar_points is not None:
@@ -550,7 +531,7 @@ class MyAgent(AutonomousAgent):
 
         return front_radar_depth <= self._front_radar_resume_distance
 
-    def _apply_sensor_navigation(self, control, current_waypoint, front_vehicle_state):
+    def _apply_sensor_navigation(self, control, current_waypoint, front_vehicle_state, left_oncoming):
         if self._overtake_state in ("follow_lane", "waiting_left"):
             if self._is_front_obstacle_active(front_vehicle_state):
                 brake_value = self._sensor_emergency_brake if front_vehicle_state["emergency"] else self._sensor_stop_brake
@@ -561,7 +542,47 @@ class MyAgent(AutonomousAgent):
                 if front_vehicle_state["distance_m"] is not None and front_vehicle_state["distance_m"] < self._front_vehicle_emergency_distance:
                     return self._apply_brake_override(control, self._sensor_stop_brake)
 
+        if self._overtake_state in ("changing_left", "passing"):
+            if left_oncoming is not None:
+                self._log_overtake_fail_safe("left_oncoming", front_vehicle_state, left_oncoming)
+                return self._apply_brake_override(control, self._sensor_emergency_brake)
+
+            front_radar_depth = front_vehicle_state.get("front_radar_depth") if front_vehicle_state else None
+            front_radar_velocity = front_vehicle_state.get("front_radar_velocity") if front_vehicle_state else None
+            if (
+                front_radar_depth is not None
+                and front_radar_velocity is not None
+                and front_radar_depth <= self._overtake_fail_safe_distance
+                and front_radar_velocity <= self._overtake_fail_safe_velocity
+            ):
+                self._log_overtake_fail_safe("front_radar_closing", front_vehicle_state, left_oncoming)
+                return self._apply_brake_override(control, self._sensor_emergency_brake)
+
         return control
+
+    def _log_overtake_fail_safe(self, reason, front_vehicle_state, left_oncoming):
+        if self._current_timestamp - self._last_overtake_fail_safe_log_timestamp < 0.5:
+            return
+
+        self._last_overtake_fail_safe_log_timestamp = self._current_timestamp
+        front_radar_depth = front_vehicle_state.get("front_radar_depth") if front_vehicle_state else None
+        front_radar_velocity = front_vehicle_state.get("front_radar_velocity") if front_vehicle_state else None
+        oncoming_text = self._summarize_oncoming(left_oncoming)
+        front_text = "clear"
+        if front_radar_depth is not None:
+            if front_radar_velocity is None:
+                front_text = "{:.1f}m".format(front_radar_depth)
+            else:
+                front_text = "{:.1f}m {:.1f}m/s".format(front_radar_depth, front_radar_velocity)
+
+        print(
+            "[OvertakeFailSafe] state={} reason={} oncoming={} front={}".format(
+                self._overtake_state,
+                reason,
+                oncoming_text,
+                front_text,
+            )
+        )
 
     def _get_current_waypoint(self):
         hero_actor = self._hero_actor or self._get_hero_actor()
@@ -1204,29 +1225,71 @@ class MyAgent(AutonomousAgent):
         best_detection = None
         best_area = 0.0
         frame_area = float(self.camera_width * self.camera_height)
+        debug_items = []
 
         for detection in detections:
             label = detection["label"].lower()
-            if label not in self._vehicle_detection_labels:
-                continue
-            if detection["confidence"] < self._left_oncoming_min_confidence:
-                continue
-
             x1, y1, x2, y2 = detection["bbox"]
             area_ratio = max((x2 - x1) * (y2 - y1), 0.0) / frame_area
             center_x_ratio = 0.5 * (x1 + x2) / float(self.camera_width)
-            if area_ratio < self._left_oncoming_min_area_ratio:
+
+            reason = "accepted"
+            if label not in self._vehicle_detection_labels:
+                reason = "label"
+                debug_items.append(self._format_leftcam_debug_item(detection, area_ratio, center_x_ratio, reason))
                 continue
-            if center_x_ratio < self._left_oncoming_min_center_x_ratio:
-                continue
-            if center_x_ratio > self._left_oncoming_max_center_x_ratio:
+            if detection["confidence"] < self._left_oncoming_min_confidence:
+                reason = "low_conf"
+                debug_items.append(self._format_leftcam_debug_item(detection, area_ratio, center_x_ratio, reason))
                 continue
 
+            if area_ratio < self._left_oncoming_min_area_ratio:
+                reason = "small_area"
+                debug_items.append(self._format_leftcam_debug_item(detection, area_ratio, center_x_ratio, reason))
+                continue
+            if center_x_ratio < self._left_oncoming_min_center_x_ratio:
+                reason = "too_left"
+                debug_items.append(self._format_leftcam_debug_item(detection, area_ratio, center_x_ratio, reason))
+                continue
+            if center_x_ratio > self._left_oncoming_max_center_x_ratio:
+                reason = "too_right"
+                debug_items.append(self._format_leftcam_debug_item(detection, area_ratio, center_x_ratio, reason))
+                continue
+
+            debug_items.append(self._format_leftcam_debug_item(detection, area_ratio, center_x_ratio, reason))
             if area_ratio > best_area:
                 best_detection = detection
                 best_area = area_ratio
 
+        self._log_leftcam_filter_debug(debug_items, best_detection)
         return best_detection
+
+    def _format_leftcam_debug_item(self, detection, area_ratio, center_x_ratio, reason):
+        return "{} {:.2f} area={:.4f} cx={:.3f} {}".format(
+            detection["label"],
+            detection["confidence"],
+            area_ratio,
+            center_x_ratio,
+            reason,
+        )
+
+    def _log_leftcam_filter_debug(self, debug_items, best_detection):
+        if not debug_items:
+            return
+        if self._current_timestamp - self._last_leftcam_filter_debug_timestamp < 0.5:
+            return
+
+        self._last_leftcam_filter_debug_timestamp = self._current_timestamp
+        selected = "none" if best_detection is None else "{} {:.2f}".format(
+            best_detection["label"],
+            best_detection["confidence"],
+        )
+        print(
+            "[LeftCamDebug] selected={} | {}".format(
+                selected,
+                " | ".join(debug_items[:4]),
+            )
+        )
 
     def _detect_rear_approaching_vehicle(self, rear_radar_points):
         if rear_radar_points is None or len(rear_radar_points) == 0:
