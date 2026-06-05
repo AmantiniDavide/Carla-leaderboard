@@ -122,7 +122,7 @@ class CameraDisplay(object):
             label_y = max(rect.y - label_surface.get_height() - 2, 0)
             self._display.blit(label_surface, (rect.x, label_y))
 
-    def render(self, center_image=None, left_image=None, speed_mps=None,
+    def render(self, center_image=None, left_image=None, rear_image=None, speed_mps=None,
                detections=None,
                navigation_state=None,
                front_radar=None, rear_radar=None):
@@ -159,7 +159,17 @@ class CameraDisplay(object):
             self._display.blit(left_surface, inset_rect.topleft)
             self._draw_text_lines(["LeftCam"], (inset_rect.x + 8, inset_rect.y + 8), self._small_font)
 
-        info_lines = ["Center RGB + LeftCam active"]
+        if center_image is not None and rear_image is not None:
+            rear_surface = pygame.transform.smoothscale(
+                self._image_to_surface(rear_image),
+                (inset_width, inset_height),
+            )
+            inset_rect = pygame.Rect(20, 40 + inset_height, inset_width, inset_height)
+            pygame.draw.rect(self._display, (0, 0, 0), inset_rect.inflate(6, 6))
+            self._display.blit(rear_surface, inset_rect.topleft)
+            self._draw_text_lines(["RearCam"], (inset_rect.x + 8, inset_rect.y + 8), self._small_font)
+
+        info_lines = ["Center RGB + debug cams active"]
         if speed_mps is None:
             info_lines.append("Speed: unavailable")
         else:
@@ -251,6 +261,9 @@ class MyAgent(AutonomousAgent):
         self._front_vehicle_min_bottom_ratio = 0.35
         self._rear_approach_distance = 18.0
         self._rear_approach_velocity = -2.0
+        self._rear_lane_occupied_distance = 14.0
+        self._rear_lane_occupied_abs_velocity = 1.0
+        self._rear_lane_occupied_min_points = 4
         self._left_oncoming_min_confidence = 0.45
         self._left_oncoming_min_area_ratio = 0.0025
         self._left_oncoming_min_center_x_ratio = 0.15
@@ -350,6 +363,19 @@ class MyAgent(AutonomousAgent):
                 "horizontal_fov": 60,
                 "vertical_fov": 20,
                 "id": "RearRdr",
+            },
+            {
+               "type": "sensor.camera.rgb",
+                "x": -1.7,
+                "y": -1.0,
+                "z": 1.60,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": -135.0,
+                "width": self.camera_width,
+                "height": self.camera_height,
+                "fov": 100,
+                "id": "RearCam",
             }
         ]
 
@@ -359,6 +385,7 @@ class MyAgent(AutonomousAgent):
         """
         self._current_timestamp = timestamp
         left_camera = input_data.get("LeftCam")
+        rear_camera = input_data.get("RearCam")
         center_camera = input_data.get("Center")
         speed_data = input_data.get("Speed")
         front_radar = input_data.get("FrontRdr")
@@ -366,6 +393,7 @@ class MyAgent(AutonomousAgent):
 
         center_image = center_camera[1] if center_camera is not None else None
         left_image = left_camera[1] if left_camera is not None else None
+        rear_image = rear_camera[1] if rear_camera is not None else None
         yolo_detections = []
         speed_mps = speed_data[1]["speed"] if speed_data is not None else None
         raw_front_radar_points = front_radar[1] if front_radar is not None else None
@@ -395,6 +423,7 @@ class MyAgent(AutonomousAgent):
             left_oncoming,
             rear_approaching,
             left_image,
+            rear_image,
             speed_data[1] if speed_data is not None else None,
             raw_front_radar_points,
             raw_rear_radar_points,
@@ -443,6 +472,7 @@ class MyAgent(AutonomousAgent):
         self._display.render(
             center_image=center_image,
             left_image=left_image,
+            rear_image=rear_image,
             speed_mps=speed_mps,
             detections=[],
             navigation_state=self._overtake_state,
@@ -455,7 +485,7 @@ class MyAgent(AutonomousAgent):
                              front_vehicle_state,
                              left_oncoming,
                              rear_approaching,
-                             left_image, speed_data,
+                             left_image, rear_image, speed_data,
                              front_radar_points, rear_radar_points):
         if self._sensor_snapshot_logged:
             return
@@ -474,6 +504,8 @@ class MyAgent(AutonomousAgent):
                 rear_approaching["distance_m"], rear_approaching["velocity_mps"]))
         if left_image is not None:
             print("[Sensors] LeftCam image shape={} dtype={}".format(left_image.shape, left_image.dtype))
+        if rear_image is not None:
+            print("[Sensors] RearCam image shape={} dtype={}".format(rear_image.shape, rear_image.dtype))
         if speed_data is not None:
             print("[Sensors] Speed payload={}".format(speed_data))
         if front_radar_points is not None:
@@ -1421,17 +1453,30 @@ class MyAgent(AutonomousAgent):
         if len(valid_points) == 0:
             return None
 
-        candidates = valid_points[
+        approaching_candidates = valid_points[
             (valid_points[:, 0] <= self._rear_approach_distance)
             & (valid_points[:, 3] <= self._rear_approach_velocity)
         ]
-        if len(candidates) == 0:
+        if len(approaching_candidates) > 0:
+            nearest = approaching_candidates[np.argmin(approaching_candidates[:, 0])]
+            return {
+                "distance_m": float(nearest[0]),
+                "velocity_mps": float(nearest[3]),
+                "mode": "approaching",
+            }
+
+        occupied_candidates = valid_points[
+            (valid_points[:, 0] <= self._rear_lane_occupied_distance)
+            & (np.abs(valid_points[:, 3]) <= self._rear_lane_occupied_abs_velocity)
+        ]
+        if len(occupied_candidates) < self._rear_lane_occupied_min_points:
             return None
 
-        nearest = candidates[np.argmin(candidates[:, 0])]
+        nearest = occupied_candidates[np.argmin(occupied_candidates[:, 0])]
         return {
             "distance_m": float(nearest[0]),
             "velocity_mps": float(nearest[3]),
+            "mode": "occupied",
         }
 
     def _run_yolo(self, center_image):
@@ -1522,7 +1567,9 @@ class MyAgent(AutonomousAgent):
     def _summarize_rear_approach(rear_approaching):
         if rear_approaching is None:
             return "clear"
-        return "{:.1f}m {:.1f}m/s".format(
+        mode = rear_approaching.get("mode", "approaching")
+        return "{} {:.1f}m {:.1f}m/s".format(
+            mode,
             rear_approaching["distance_m"],
             rear_approaching["velocity_mps"],
         )
