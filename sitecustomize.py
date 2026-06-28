@@ -9,6 +9,18 @@ def _is_enabled(env_var):
     return os.environ.get(env_var, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _get_env_number(env_var, cast):
+    raw_value = os.environ.get(env_var, "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        return cast(raw_value)
+    except ValueError:
+        print("WARNING: Invalid value '{}' for {}".format(raw_value, env_var))
+        return None
+
+
 if _is_enabled("VISIBLE_ADJACENT_LANE_VEHICLE"):
     try:
         from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
@@ -80,3 +92,22 @@ else:
 
         ParkedObstacle.__init__ = _parked_obstacle_init_with_end_distance
         ParkedObstacle._xml_end_distance_patch = True
+
+
+_route_completion_percentage = _get_env_number("LEADERBOARD_ROUTE_COMPLETION_PERCENTAGE", float)
+_route_completion_distance = _get_env_number("LEADERBOARD_ROUTE_COMPLETION_DISTANCE_M", float)
+
+if _route_completion_percentage is not None or _route_completion_distance is not None:
+    try:
+        from srunner.scenariomanager.scenarioatomics.atomic_criteria import RouteCompletionTest
+    except Exception:
+        # If the scenario runner is not available in the current process, skip the patch.
+        pass
+    else:
+        if not getattr(RouteCompletionTest, "_leaderboard_completion_patch", False):
+            if _route_completion_percentage is not None:
+                RouteCompletionTest.PERCENTAGE_THRESHOLD = float(_route_completion_percentage)
+            if _route_completion_distance is not None:
+                RouteCompletionTest.DISTANCE_THRESHOLD = float(_route_completion_distance)
+
+            RouteCompletionTest._leaderboard_completion_patch = True

@@ -41,6 +41,7 @@ class AutonomousAgent(object):
         #  current global plans to reach a destination
         self._global_plan = None
         self._global_plan_world_coord = None
+        self._route_metadata = {}
 
         # this data structure will contain all sensor data
         self.sensor_interface = SensorInterface()
@@ -140,3 +141,20 @@ class AutonomousAgent(object):
         ds_ids = downsample_route(global_plan_world_coord, 200)
         self._global_plan_world_coord = [(global_plan_world_coord[x][0], global_plan_world_coord[x][1]) for x in ds_ids]
         self._global_plan = [global_plan_gps[x] for x in ds_ids]
+
+    def set_route_metadata(self, route_id=None, route_index=None, repetition_index=None, town=None):
+        """
+        Store route metadata coming from the leaderboard evaluator.
+        """
+        self._route_metadata = {
+            "route_id": route_id,
+            "route_index": route_index,
+            "repetition_index": repetition_index,
+            "town": town,
+        }
+
+    def get_route_metadata(self):
+        """
+        Return the current route metadata, if any.
+        """
+        return dict(self._route_metadata)

@@ -293,6 +293,12 @@ class LeaderboardEvaluator(object):
                 self._ros1_server.start()
 
             self.agent_instance = agent_class_obj(args.host, args.port, args.debug)
+            self.agent_instance.set_route_metadata(
+                route_id=route_name,
+                route_index=config.index,
+                repetition_index=config.repetition_index,
+                town=config.town,
+            )
             self.agent_instance.set_global_plan(self.route_scenario.gps_route, self.route_scenario.route)
             self.agent_instance.setup(args.agent_config)
 

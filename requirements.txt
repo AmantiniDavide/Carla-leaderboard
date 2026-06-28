@@ -1,5 +1,6 @@
 dictor
 requests
+numpy
 opencv-python>=4.8.0
 pygame
 tabulate

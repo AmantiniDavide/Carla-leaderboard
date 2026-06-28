@@ -9,6 +9,8 @@ Simple autonomous agent that follows the leaderboard route using CARLA's BasicAg
 
 from __future__ import print_function
 
+import time
+
 import carla
 import numpy as np
 from ultralytics import YOLO
@@ -17,6 +19,8 @@ from agents.navigation.local_planner import RoadOption
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
+from leaderboard.autoagents.mpc_controller import LateralMPCController
+from leaderboard.metrics.metrics_logger import MetricsLogger
 
 try:
     import pygame
@@ -105,13 +109,29 @@ class CameraDisplay(object):
         ]
         self._draw_text_lines(summary_lines, (rect.x + 8, rect.y + rect.h - 56), self._small_font)
 
-    def _draw_detection_overlay(self, detections):
+    def _draw_detection_overlay(self, detections, target_rect=None, source_size=None):
         if not detections:
             return
 
+        if target_rect is None:
+            target_rect = pygame.Rect(0, 0, self._width, self._height)
+
+        if source_size is None:
+            source_width, source_height = target_rect.w, target_rect.h
+        else:
+            source_width, source_height = source_size
+
+        scale_x = target_rect.w / max(float(source_width), 1.0)
+        scale_y = target_rect.h / max(float(source_height), 1.0)
+
         for detection in detections:
             x1, y1, x2, y2 = detection["bbox"]
-            rect = pygame.Rect(int(x1), int(y1), max(int(x2 - x1), 1), max(int(y2 - y1), 1))
+            rect = pygame.Rect(
+                int(target_rect.x + x1 * scale_x),
+                int(target_rect.y + y1 * scale_y),
+                max(int((x2 - x1) * scale_x), 1),
+                max(int((y2 - y1) * scale_y), 1),
+            )
             pygame.draw.rect(self._display, (255, 200, 64), rect, 2)
 
             label = "{} {:.2f}".format(detection["label"], detection["confidence"])
@@ -119,11 +139,12 @@ class CameraDisplay(object):
                 label = "{} {:.1f}m".format(label, detection["distance_m"])
 
             label_surface = self._small_font.render(label, True, (24, 24, 24), (255, 200, 64))
-            label_y = max(rect.y - label_surface.get_height() - 2, 0)
+            label_y = max(rect.y - label_surface.get_height() - 2, target_rect.y)
             self._display.blit(label_surface, (rect.x, label_y))
 
     def render(self, center_image=None, left_image=None, rear_image=None, speed_mps=None,
                detections=None,
+               left_detections=None,
                navigation_state=None,
                front_radar=None, rear_radar=None):
         """
@@ -157,6 +178,11 @@ class CameraDisplay(object):
             inset_rect = pygame.Rect(20, 20, inset_width, inset_height)
             pygame.draw.rect(self._display, (0, 0, 0), inset_rect.inflate(6, 6))
             self._display.blit(left_surface, inset_rect.topleft)
+            self._draw_detection_overlay(
+                left_detections,
+                target_rect=inset_rect,
+                source_size=(left_image.shape[1], left_image.shape[0]),
+            )
             self._draw_text_lines(["LeftCam"], (inset_rect.x + 8, inset_rect.y + 8), self._small_font)
 
         if center_image is not None and rear_image is not None:
@@ -174,10 +200,10 @@ class CameraDisplay(object):
             info_lines.append("Speed: unavailable")
         else:
             info_lines.append("Speed: {:.2f} m/s ({:.1f} km/h)".format(speed_mps, speed_mps * 3.6))
-        if detections:
-            info_lines.append("YOLO: {} objs".format(len(detections)))
+        if left_detections:
+            info_lines.append("Left YOLO: {} objs".format(len(left_detections)))
         else:
-            info_lines.append("YOLO: none")
+            info_lines.append("Left YOLO: none")
         if navigation_state is not None:
             info_lines.append("Maneuver: {}".format(navigation_state))
         info_lines.append("Radar format: [depth, altitude, azimuth, velocity]")
@@ -201,6 +227,8 @@ class CameraDisplay(object):
         pygame.display.flip()
 
     def close(self):
+        if pygame.display.get_init():
+            pygame.display.quit()
         pygame.quit()
 
 
@@ -217,10 +245,57 @@ class MyAgent(AutonomousAgent):
         self._agent = None
         self._hero_actor = None
         self._route_assigned = False
+        self._controller_mode = "basic_agent"
+        self._controller_mode_explicit = False
+        self._controller_name = "basic_agent"
         self._target_speed = 20.0
+        self._active_target_speed = self._target_speed
         self.camera_width = 1280
         self.camera_height = 720
         self._display = CameraDisplay(self.camera_width, self.camera_height)
+        self._metrics_enabled = True
+        self._metrics_dir = "artifacts/metrics"
+        self._metrics_run_label = ""
+        self._metrics_flush_interval = 25
+        self._metrics_logger = None
+        self._last_safety_intervention = {
+            "override": False,
+            "reason": "",
+            "requested_brake": 0.0,
+        }
+        self._last_controller_diagnostics = self._make_controller_diagnostics(status="basic_agent_pid")
+        self._basic_agent_hazard_brake_threshold = 0.49
+        self._mpc_controller = None
+        self._mpc_horizon_steps = 12
+        self._mpc_prediction_dt = 0.10
+        self._mpc_wheel_base_m = 2.875
+        self._mpc_max_steer_delta_per_cycle = 0.18
+        self._mpc_max_steer_angle_deg = 35.0
+        self._mpc_follow_steer_step_limit = 0.08
+        self._mpc_lane_change_steer_step_limit = 0.12
+        self._mpc_same_lane_change_steer_limit = 0.80
+        self._mpc_close_front_steer_limit = 0.80
+        self._mpc_lane_change_commitment_min_steer = 0.58
+        self._mpc_lane_change_commitment_release_lateral_m = 0.45
+        self._mpc_lane_change_commitment_release_distance_m = 50.0
+        self._mpc_left_release_speed_mps = 2.60
+        self._mpc_left_release_heading_deg = 24.5
+        self._mpc_left_release_lateral_error_m = 0.85
+        self._mpc_left_release_progress = 0.24
+        self._mpc_left_release_max_steer = 0.52
+        self._mpc_left_final_release_speed_mps = 3.55
+        self._mpc_left_final_release_heading_deg = 28.6
+        self._mpc_left_final_release_lateral_error_m = 1.10
+        self._mpc_left_final_release_progress = 0.32
+        self._mpc_left_final_release_max_steer = 0.12
+        self._mpc_rejoin_steer_limit = 0.45
+        self._mpc_rejoin_soft_heading_deg = 12.0
+        self._mpc_rejoin_soft_lateral_error_m = 1.0
+        self._mpc_rejoin_hard_heading_deg = 6.0
+        self._mpc_rejoin_hard_lateral_error_m = 0.45
+        self._mpc_rejoin_finish_max_heading_error_deg = 5.0
+        self._mpc_rejoin_finish_max_lateral_error_m = 0.40
+        self._mpc_rejoin_finish_max_abs_steer = 0.18
         self._current_timestamp = 0.0
         self._last_debug_timestamp = -1.0
         self._sensor_snapshot_logged = False
@@ -245,6 +320,13 @@ class MyAgent(AutonomousAgent):
         self._front_vehicle_stop_distance = 8.0
         self._front_vehicle_resume_distance = 18.0
         self._front_vehicle_emergency_distance = 5.0
+        self._front_vehicle_min_hold_distance = 2.3
+        self._front_vehicle_reaction_time_s = 0.20
+        self._front_vehicle_comfort_decel_mps2 = 4.5
+        self._front_vehicle_low_speed_mps = 0.75
+        self._front_vehicle_restart_speed_mps = 1.2
+        self._front_vehicle_ttc_brake_s = 2.2
+        self._front_vehicle_ttc_emergency_s = 1.0
         self._front_radar_trigger_distance = 10.0
         self._front_radar_resume_distance = 12.0
         self._front_radar_min_points = 2
@@ -261,9 +343,16 @@ class MyAgent(AutonomousAgent):
         self._front_vehicle_min_bottom_ratio = 0.35
         self._rear_approach_distance = 18.0
         self._rear_approach_velocity = -2.0
+        self._rear_approach_ttc_threshold_s = 4.5
+        self._rear_approach_close_distance = 7.5
         self._rear_lane_occupied_distance = 14.0
         self._rear_lane_occupied_abs_velocity = 1.0
         self._rear_lane_occupied_min_points = 4
+        self._rear_lane_hold_distance = 8.0
+        self._rear_lane_release_distance = 4.5
+        self._rear_lane_release_velocity_mps = 0.10
+        self._rear_lane_release_closing_speed_mps = 0.35
+        self._rear_lane_release_ttc_s = 6.0
         self._left_oncoming_min_confidence = 0.45
         self._left_oncoming_min_area_ratio = 0.0025
         self._left_oncoming_min_center_x_ratio = 0.15
@@ -279,6 +368,15 @@ class MyAgent(AutonomousAgent):
         self._overtake_same_lane_distance = 2.0
         self._overtake_lane_change_distance = 8.0
         self._overtake_other_lane_distance = 20.0
+        self._mpc_overtake_same_lane_distance = 0.8
+        self._mpc_waiting_left_close_stop_distance = 6.4
+        self._mpc_waiting_left_close_stop_brake = 0.78
+        self._mpc_lane_change_launch_grace_time = 1.0
+        self._mpc_lane_change_launch_min_front_distance = 4.0
+        self._mpc_lane_change_launch_min_steer = 0.20
+        self._mpc_lane_change_launch_min_throttle = 0.12
+        self._mpc_lane_change_launch_throttle = 0.18
+        self._mpc_lane_change_resume_speed_mps = 0.25
         self._return_same_lane_distance = 4.0
         self._return_lane_change_distance = 8.0
         self._return_other_lane_distance = 8.0
@@ -286,6 +384,7 @@ class MyAgent(AutonomousAgent):
         self._min_right_lane_settle_time = 0.8
         self._post_overtake_cooldown_time = 2.0
         self._route_rejoin_min_distance = 8.0
+        self._front_collision_risk_distance = 4.5
         self._overtake_state = "follow_lane"
         self._blocked_vehicle_since = None
         self._overtake_started_at = None
@@ -303,6 +402,13 @@ class MyAgent(AutonomousAgent):
 
         if path_to_conf_file:
             self._load_config(path_to_conf_file)
+        if not self._controller_mode_explicit and self._controller_name.lower() in ("mpc", "mpc_lateral", "shooting_mpc"):
+            self._controller_mode = "mpc"
+        self._controller_mode = self._normalize_controller_mode(self._controller_mode)
+        if self._controller_mode == "mpc" and self._controller_name == "basic_agent":
+            self._controller_name = "mpc"
+        self._active_target_speed = self._target_speed
+        self._initialize_metrics_logger(path_to_conf_file)
 
     def sensors(self):
         """
@@ -396,6 +502,13 @@ class MyAgent(AutonomousAgent):
         rear_image = rear_camera[1] if rear_camera is not None else None
         yolo_detections = []
         speed_mps = speed_data[1]["speed"] if speed_data is not None else None
+        frame_id = (
+            speed_data[0]
+            if speed_data is not None
+            else center_camera[0]
+            if center_camera is not None
+            else -1
+        )
         raw_front_radar_points = front_radar[1] if front_radar is not None else None
         raw_rear_radar_points = rear_radar[1] if rear_radar is not None else None
         front_radar_points = self._extract_front_cluster(raw_front_radar_points)
@@ -449,6 +562,8 @@ class MyAgent(AutonomousAgent):
                 self._target_speed,
                 opt_dict={"ignore_vehicles": True},
             )
+            self._ensure_runtime_controller()
+            self._active_target_speed = self._target_speed
 
         if not self._route_assigned:
             self._set_agent_route()
@@ -462,12 +577,27 @@ class MyAgent(AutonomousAgent):
             left_oncoming,
             rear_approaching,
         )
-        control = self._agent.run_step()
+        control = self._run_selected_controller(
+            speed_mps,
+            current_waypoint=current_waypoint,
+            front_vehicle_state=front_vehicle_state,
+        )
         control = self._apply_sensor_navigation(
             control,
             current_waypoint,
             front_vehicle_state,
             left_oncoming,
+            speed_mps=speed_mps,
+        )
+        self._record_metrics(
+            frame_id,
+            speed_mps,
+            current_waypoint,
+            front_vehicle_state,
+            rear_radar_points,
+            rear_approaching,
+            left_oncoming,
+            control,
         )
         self._display.render(
             center_image=center_image,
@@ -475,11 +605,444 @@ class MyAgent(AutonomousAgent):
             rear_image=rear_image,
             speed_mps=speed_mps,
             detections=[],
+            left_detections=left_yolo_detections,
             navigation_state=self._overtake_state,
             front_radar=front_radar_points,
             rear_radar=rear_radar_points,
         )
         return control
+
+    @staticmethod
+    def _normalize_controller_mode(value):
+        normalized = (value or "").strip().lower()
+        if normalized in ("mpc", "mpc_lateral", "shooting_mpc"):
+            return "mpc"
+        return "basic_agent"
+
+    @staticmethod
+    def _compute_speed_mps_from_actor(actor):
+        if actor is None:
+            return None
+        try:
+            velocity = actor.get_velocity()
+        except RuntimeError:
+            return None
+        return float(np.linalg.norm([velocity.x, velocity.y, velocity.z]))
+
+    @staticmethod
+    def _make_controller_diagnostics(compute_time_ms=0.0, fallback=False, status="", reference_count=0, candidate_count=0):
+        return {
+            "compute_time_ms": float(compute_time_ms or 0.0),
+            "fallback": bool(fallback),
+            "status": status or "",
+            "reference_count": int(reference_count or 0),
+            "candidate_count": int(candidate_count or 0),
+        }
+
+    def _set_controller_diagnostics(self, compute_time_ms=0.0, fallback=False, status="", reference_count=0, candidate_count=0):
+        self._last_controller_diagnostics = self._make_controller_diagnostics(
+            compute_time_ms=compute_time_ms,
+            fallback=fallback,
+            status=status,
+            reference_count=reference_count,
+            candidate_count=candidate_count,
+        )
+
+    def _ensure_runtime_controller(self):
+        if self._controller_mode != "mpc" or self._mpc_controller is not None:
+            return
+
+        self._mpc_controller = LateralMPCController(
+            horizon_steps=self._mpc_horizon_steps,
+            prediction_dt=self._mpc_prediction_dt,
+            wheel_base_m=self._mpc_wheel_base_m,
+            max_steer_delta_per_cycle=self._mpc_max_steer_delta_per_cycle,
+            max_steer_angle_deg=self._mpc_max_steer_angle_deg,
+        )
+
+    def _run_selected_controller(self, speed_mps, current_waypoint=None, front_vehicle_state=None):
+        base_control = self._agent.run_step()
+        if self._controller_mode != "mpc":
+            self._set_controller_diagnostics(status="basic_agent_pid")
+            return base_control
+
+        self._ensure_runtime_controller()
+        if self._mpc_controller is None:
+            self._set_controller_diagnostics(fallback=True, status="mpc_unavailable")
+            return base_control
+
+        if (
+            base_control.brake >= self._basic_agent_hazard_brake_threshold
+            and base_control.throttle <= 1e-3
+        ):
+            self._set_controller_diagnostics(fallback=True, status="basic_agent_hazard_stop")
+            return base_control
+
+        local_planner = self._agent.get_local_planner()
+        plan = list(local_planner.get_plan()) if local_planner is not None else []
+        if not plan:
+            self._set_controller_diagnostics(fallback=True, status="planner_empty")
+            return base_control
+
+        hero_actor = self._hero_actor or self._get_hero_actor()
+        if hero_actor is None:
+            self._set_controller_diagnostics(fallback=True, status="hero_unavailable")
+            return base_control
+
+        try:
+            transform = hero_actor.get_transform()
+            current_control = hero_actor.get_control()
+        except RuntimeError:
+            self._set_controller_diagnostics(fallback=True, status="hero_state_unavailable")
+            return base_control
+
+        effective_speed_mps = speed_mps if speed_mps is not None else self._compute_speed_mps_from_actor(hero_actor)
+        start_time = time.perf_counter()
+        try:
+            result = self._mpc_controller.compute_steer(
+                vehicle_transform=transform,
+                speed_mps=effective_speed_mps,
+                plan=plan,
+                current_steer=current_control.steer,
+                fallback_steer=base_control.steer,
+            )
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            print("WARNING: MPC controller failed: {}".format(exc))
+            self._set_controller_diagnostics(
+                compute_time_ms=elapsed_ms,
+                fallback=True,
+                status="mpc_exception",
+            )
+            return base_control
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        self._set_controller_diagnostics(
+            compute_time_ms=elapsed_ms,
+            fallback=False,
+            status=result.status,
+            reference_count=result.reference_count,
+            candidate_count=result.candidate_count,
+        )
+        base_control.steer = self._shape_mpc_steer_command(
+            raw_steer=result.steer,
+            current_steer=current_control.steer,
+            current_waypoint=current_waypoint,
+            front_vehicle_state=front_vehicle_state,
+            vehicle_transform=transform,
+            speed_mps=effective_speed_mps,
+        )
+        return base_control
+
+    def _shape_mpc_steer_command(
+        self,
+        raw_steer,
+        current_steer,
+        current_waypoint,
+        front_vehicle_state,
+        vehicle_transform=None,
+        speed_mps=None,
+    ):
+        target_steer = float(np.clip(raw_steer, -1.0, 1.0))
+        step_limit = self._mpc_follow_steer_step_limit
+        max_abs_steer = 1.0
+        same_lane_left_change = (
+            self._overtake_state == "changing_left"
+            and current_waypoint is not None
+            and self._overtake_origin_lane_id is not None
+            and current_waypoint.lane_id == self._overtake_origin_lane_id
+        )
+        same_lane_right_change = (
+            self._overtake_state == "changing_right"
+            and current_waypoint is not None
+            and self._overtake_origin_lane_id is not None
+            and current_waypoint.lane_id == self._overtake_origin_lane_id
+        )
+
+        if self._overtake_state in ("changing_left", "changing_right"):
+            step_limit = self._mpc_lane_change_steer_step_limit
+
+        if same_lane_left_change:
+            max_abs_steer = self._mpc_same_lane_change_steer_limit
+        elif same_lane_right_change:
+            max_abs_steer = min(max_abs_steer, self._mpc_rejoin_steer_limit)
+
+        target_steer = float(np.clip(target_steer, -max_abs_steer, max_abs_steer))
+        steer_delta = float(target_steer - current_steer)
+        steer_delta = float(np.clip(steer_delta, -step_limit, step_limit))
+        smoothed_steer = float(current_steer + steer_delta)
+
+        front_distance_m = self._get_front_clearance_m(front_vehicle_state)
+        if same_lane_left_change and front_distance_m is not None and front_distance_m <= self._front_vehicle_emergency_distance + 0.2:
+            close_front_limit = min(self._mpc_same_lane_change_steer_limit, self._mpc_close_front_steer_limit)
+            smoothed_steer = float(np.clip(smoothed_steer, -close_front_limit, close_front_limit))
+
+        target_lane_metrics = self._compute_target_lane_tracking_metrics(current_waypoint, vehicle_transform)
+        current_lane_metrics = self._compute_current_lane_tracking_metrics(current_waypoint, vehicle_transform)
+        if same_lane_left_change and self._should_hold_mpc_lane_change_commitment(
+            front_vehicle_state,
+            target_lane_metrics,
+            current_lane_metrics,
+            speed_mps,
+        ):
+            commitment_steer = -self._compute_mpc_lane_change_commitment_steer(target_lane_metrics)
+            smoothed_steer = min(smoothed_steer, commitment_steer)
+            smoothed_steer = self._shape_mpc_left_change_release_steer(
+                smoothed_steer,
+                current_lane_metrics,
+                target_lane_metrics,
+                speed_mps,
+            )
+        elif same_lane_left_change:
+            smoothed_steer = self._shape_mpc_left_change_release_steer(
+                smoothed_steer,
+                current_lane_metrics,
+                target_lane_metrics,
+                speed_mps,
+            )
+        if same_lane_right_change:
+            smoothed_steer = self._shape_mpc_rejoin_settle_steer(smoothed_steer, current_lane_metrics)
+
+        return smoothed_steer
+
+    def _should_hold_mpc_lane_change_commitment(
+        self,
+        front_vehicle_state,
+        target_lane_metrics,
+        current_lane_metrics=None,
+        speed_mps=None,
+    ):
+        if self._controller_mode != "mpc":
+            return False
+        if self._overtake_state != "changing_left":
+            return False
+
+        if self._should_release_mpc_left_change_steer(current_lane_metrics, target_lane_metrics, speed_mps):
+            return False
+
+        if not target_lane_metrics:
+            return True
+        progress = target_lane_metrics.get("progress")
+        target_lane_lateral_abs_m = target_lane_metrics.get("lateral_error_abs_m")
+        if progress is None or target_lane_lateral_abs_m is None:
+            return True
+
+        if target_lane_lateral_abs_m > self._mpc_lane_change_commitment_release_lateral_m:
+            return True
+        if progress < 0.93:
+            return True
+
+        front_distance_m = self._get_front_clearance_m(front_vehicle_state)
+        if front_distance_m is None:
+            return False
+        return front_distance_m <= self._mpc_lane_change_commitment_release_distance_m
+
+    def _should_release_mpc_left_change_steer(self, current_lane_metrics, target_lane_metrics, speed_mps):
+        if not current_lane_metrics:
+            return False
+
+        speed_mps = float(speed_mps or 0.0)
+        heading_error_abs_deg = current_lane_metrics.get("heading_error_abs_deg")
+        lateral_error_abs_m = current_lane_metrics.get("lateral_error_abs_m")
+        progress = None if not target_lane_metrics else target_lane_metrics.get("progress")
+        if heading_error_abs_deg is None or lateral_error_abs_m is None:
+            return False
+
+        if speed_mps < self._mpc_left_release_speed_mps:
+            return False
+
+        return (
+            heading_error_abs_deg >= self._mpc_left_release_heading_deg
+            or lateral_error_abs_m >= self._mpc_left_release_lateral_error_m
+            or (progress is not None and progress >= self._mpc_left_release_progress)
+        )
+
+    def _shape_mpc_left_change_release_steer(
+        self,
+        smoothed_steer,
+        current_lane_metrics,
+        target_lane_metrics,
+        speed_mps,
+    ):
+        if not current_lane_metrics:
+            return smoothed_steer
+
+        speed_mps = float(speed_mps or 0.0)
+        heading_error_abs_deg = current_lane_metrics.get("heading_error_abs_deg")
+        lateral_error_abs_m = current_lane_metrics.get("lateral_error_abs_m")
+        progress = None if not target_lane_metrics else target_lane_metrics.get("progress")
+        if heading_error_abs_deg is None or lateral_error_abs_m is None:
+            return smoothed_steer
+
+        limited_steer = float(smoothed_steer)
+        if self._should_release_mpc_left_change_steer(current_lane_metrics, target_lane_metrics, speed_mps):
+            limited_steer = max(limited_steer, -self._mpc_left_release_max_steer)
+
+        if (
+            speed_mps >= self._mpc_left_final_release_speed_mps
+            and (
+                heading_error_abs_deg >= self._mpc_left_final_release_heading_deg
+                or lateral_error_abs_m >= self._mpc_left_final_release_lateral_error_m
+                or (progress is not None and progress >= self._mpc_left_final_release_progress)
+            )
+        ):
+            limited_steer = max(limited_steer, -self._mpc_left_final_release_max_steer)
+
+        return limited_steer
+
+    def _compute_mpc_lane_change_commitment_steer(self, target_lane_metrics):
+        progress = None if not target_lane_metrics else target_lane_metrics.get("progress")
+        max_commitment_steer = min(
+            self._mpc_same_lane_change_steer_limit,
+            self._mpc_close_front_steer_limit,
+            0.80,
+        )
+        if progress is None:
+            return max_commitment_steer
+
+        if progress < 0.35:
+            return max_commitment_steer
+        if progress < 0.55:
+            return min(max_commitment_steer, 0.72)
+        if progress < 0.72:
+            return min(max_commitment_steer, 0.62)
+        if progress < 0.85:
+            return min(max_commitment_steer, 0.48)
+        return min(max_commitment_steer, max(self._mpc_lane_change_commitment_min_steer, 0.30))
+
+    def _get_target_waypoint_for_active_maneuver(self, current_waypoint):
+        if current_waypoint is None:
+            return None
+
+        if self._overtake_state in ("waiting_left", "changing_left"):
+            return self._get_adjacent_driving_lane(current_waypoint, "left")
+
+        if self._overtake_state == "changing_right":
+            rejoin_waypoint, _rejoin_direction = self._find_origin_adjacent_lane(current_waypoint)
+            return rejoin_waypoint
+
+        return None
+
+    def _compute_target_lane_tracking_metrics(self, current_waypoint, ego_transform):
+        target_waypoint = self._get_target_waypoint_for_active_maneuver(current_waypoint)
+        if target_waypoint is None or ego_transform is None:
+            return {}
+
+        ego_location = ego_transform.location
+        target_location = target_waypoint.transform.location
+        delta = np.array(
+            [
+                ego_location.x - target_location.x,
+                ego_location.y - target_location.y,
+                ego_location.z - target_location.z,
+            ],
+            dtype=np.float64,
+        )
+        target_right_vector = target_waypoint.transform.get_right_vector()
+        target_right_np = np.array(
+            [target_right_vector.x, target_right_vector.y, target_right_vector.z],
+            dtype=np.float64,
+        )
+        lateral_error_m = float(np.dot(delta, target_right_np))
+        heading_error_deg = self._normalize_angle_deg(
+            ego_transform.rotation.yaw - target_waypoint.transform.rotation.yaw
+        )
+
+        lane_spacing_m = current_waypoint.transform.location.distance(target_location)
+        if not np.isfinite(lane_spacing_m) or lane_spacing_m <= 1e-3:
+            lane_spacing_m = None
+        progress = None
+        if lane_spacing_m is not None:
+            progress = float(np.clip(1.0 - (abs(lateral_error_m) / lane_spacing_m), 0.0, 1.0))
+
+        return {
+            "target_lane_id": target_waypoint.lane_id,
+            "lateral_error_m": lateral_error_m,
+            "lateral_error_abs_m": abs(lateral_error_m),
+            "heading_error_deg": heading_error_deg,
+            "lane_spacing_m": lane_spacing_m,
+            "progress": progress,
+        }
+
+    def _compute_current_lane_tracking_metrics(self, current_waypoint, ego_transform):
+        if current_waypoint is None or ego_transform is None:
+            return {}
+
+        lateral_error_m, heading_error_deg = self._compute_tracking_errors(current_waypoint, ego_transform)
+        if lateral_error_m is None or heading_error_deg is None:
+            return {}
+
+        return {
+            "lateral_error_m": lateral_error_m,
+            "lateral_error_abs_m": abs(lateral_error_m),
+            "heading_error_deg": heading_error_deg,
+            "heading_error_abs_deg": abs(heading_error_deg),
+        }
+
+    def _shape_mpc_rejoin_settle_steer(self, smoothed_steer, current_lane_metrics):
+        if not current_lane_metrics:
+            return float(np.clip(smoothed_steer, -self._mpc_rejoin_steer_limit, self._mpc_rejoin_steer_limit))
+
+        heading_error_abs_deg = current_lane_metrics.get("heading_error_abs_deg")
+        lateral_error_abs_m = current_lane_metrics.get("lateral_error_abs_m")
+        limited_steer = float(np.clip(smoothed_steer, -self._mpc_rejoin_steer_limit, self._mpc_rejoin_steer_limit))
+
+        if (
+            heading_error_abs_deg is not None
+            and lateral_error_abs_m is not None
+            and heading_error_abs_deg <= self._mpc_rejoin_soft_heading_deg
+            and lateral_error_abs_m <= self._mpc_rejoin_soft_lateral_error_m
+        ):
+            limited_steer = float(np.clip(limited_steer, -0.25, 0.25))
+            limited_steer *= 0.65
+
+        if (
+            heading_error_abs_deg is not None
+            and lateral_error_abs_m is not None
+            and heading_error_abs_deg <= self._mpc_rejoin_hard_heading_deg
+            and lateral_error_abs_m <= self._mpc_rejoin_hard_lateral_error_m
+        ):
+            limited_steer = float(np.clip(limited_steer, -0.12, 0.12))
+            limited_steer *= 0.5
+
+        if (
+            heading_error_abs_deg is not None
+            and lateral_error_abs_m is not None
+            and heading_error_abs_deg <= 2.0
+            and lateral_error_abs_m <= 0.12
+        ):
+            limited_steer = 0.0
+
+        return limited_steer
+
+    def _is_rejoin_stabilized(self, current_waypoint):
+        if current_waypoint is None or self._overtake_origin_lane_id is None:
+            return False
+        if current_waypoint.lane_id != self._overtake_origin_lane_id:
+            return False
+
+        hero_actor = self._hero_actor or self._get_hero_actor()
+        if hero_actor is None:
+            return False
+
+        try:
+            ego_transform = hero_actor.get_transform()
+            current_control = hero_actor.get_control()
+        except RuntimeError:
+            return False
+
+        current_lane_metrics = self._compute_current_lane_tracking_metrics(current_waypoint, ego_transform)
+        if not current_lane_metrics:
+            return False
+
+        if current_lane_metrics["heading_error_abs_deg"] > self._mpc_rejoin_finish_max_heading_error_deg:
+            return False
+        if current_lane_metrics["lateral_error_abs_m"] > self._mpc_rejoin_finish_max_lateral_error_m:
+            return False
+        if abs(float(current_control.steer)) > self._mpc_rejoin_finish_max_abs_steer:
+            return False
+
+        return True
 
     def _log_sensor_snapshot(self, center_image, left_yolo_detections,
                              front_vehicle_state,
@@ -558,6 +1121,87 @@ class MyAgent(AutonomousAgent):
         control.hand_brake = False
         return control
 
+    @staticmethod
+    def _compute_ttc_s(distance_m, closing_speed_mps):
+        if distance_m is None or closing_speed_mps is None:
+            return None
+
+        distance_value = float(distance_m)
+        closing_speed_value = float(closing_speed_mps)
+        if not np.isfinite(distance_value) or not np.isfinite(closing_speed_value):
+            return None
+        if distance_value <= 0.0 or closing_speed_value <= 1e-3:
+            return None
+
+        return distance_value / closing_speed_value
+
+    def _build_front_safety_profile(self, front_vehicle_state, ego_speed_mps=None):
+        distance_m = self._get_front_clearance_m(front_vehicle_state)
+        raw_front_velocity = front_vehicle_state.get("front_radar_velocity") if front_vehicle_state else None
+        closing_speed_mps = None
+        if raw_front_velocity is not None and np.isfinite(raw_front_velocity):
+            closing_speed_mps = max(-float(raw_front_velocity), 0.0)
+
+        if closing_speed_mps is None:
+            ego_speed_mps = 0.0 if ego_speed_mps is None else max(float(ego_speed_mps), 0.0)
+            closing_speed_mps = ego_speed_mps
+
+        ego_speed_value = 0.0 if ego_speed_mps is None else max(float(ego_speed_mps), 0.0)
+        reaction_distance_m = closing_speed_mps * self._front_vehicle_reaction_time_s
+        braking_distance_m = (
+            (closing_speed_mps * closing_speed_mps) / (2.0 * max(self._front_vehicle_comfort_decel_mps2, 1e-3))
+        )
+        min_hold_distance_m = self._front_vehicle_min_hold_distance
+        dynamic_stop_distance_m = min_hold_distance_m + reaction_distance_m + 0.55 * braking_distance_m
+        dynamic_emergency_distance_m = min_hold_distance_m + reaction_distance_m + braking_distance_m
+        ttc_s = self._compute_ttc_s(distance_m, closing_speed_mps)
+
+        low_speed_restart_safe = (
+            distance_m is not None
+            and distance_m > (min_hold_distance_m + 0.15)
+            and ego_speed_value <= self._front_vehicle_restart_speed_mps
+            and (ttc_s is None or ttc_s > self._front_vehicle_ttc_emergency_s)
+        )
+        collision_risk = False
+        if distance_m is not None and distance_m <= dynamic_emergency_distance_m:
+            collision_risk = True
+        if ttc_s is not None and ttc_s <= self._front_vehicle_ttc_emergency_s:
+            collision_risk = True
+
+        return {
+            "distance_m": distance_m,
+            "closing_speed_mps": closing_speed_mps,
+            "ttc_s": ttc_s,
+            "reaction_distance_m": reaction_distance_m,
+            "braking_distance_m": braking_distance_m,
+            "min_hold_distance_m": min_hold_distance_m,
+            "dynamic_stop_distance_m": dynamic_stop_distance_m,
+            "dynamic_emergency_distance_m": dynamic_emergency_distance_m,
+            "dynamic_margin_m": (
+                None
+                if distance_m is None
+                else float(distance_m - dynamic_emergency_distance_m)
+            ),
+            "low_speed_restart_safe": low_speed_restart_safe,
+            "collision_risk": collision_risk,
+        }
+
+    def _should_block_lane_change_for_front_obstacle(self, front_vehicle_state, ego_speed_mps=None):
+        profile = self._build_front_safety_profile(front_vehicle_state, ego_speed_mps)
+        distance_m = profile["distance_m"]
+        if distance_m is None:
+            return False
+        if distance_m <= profile["min_hold_distance_m"]:
+            return True
+        if profile["ttc_s"] is not None and profile["ttc_s"] <= self._front_vehicle_ttc_emergency_s:
+            return True
+
+        ego_speed_value = 0.0 if ego_speed_mps is None else max(float(ego_speed_mps), 0.0)
+        if ego_speed_value > self._front_vehicle_restart_speed_mps:
+            return distance_m <= profile["dynamic_emergency_distance_m"]
+
+        return False
+
     def _is_front_obstacle_active(self, front_vehicle_state):
         if front_vehicle_state is None:
             return False
@@ -575,41 +1219,86 @@ class MyAgent(AutonomousAgent):
 
         return front_radar_depth <= self._front_radar_resume_distance
 
-    def _compute_front_obstacle_brake(self, front_vehicle_state):
+    def _compute_front_obstacle_brake(self, front_vehicle_state, ego_speed_mps=None):
         if front_vehicle_state is None:
             return self._sensor_stop_brake
 
-        front_radar_depth = front_vehicle_state.get("front_radar_depth")
+        profile = self._build_front_safety_profile(front_vehicle_state, ego_speed_mps)
+        front_radar_depth = profile["distance_m"]
         if front_radar_depth is None:
             return self._sensor_stop_brake
 
-        if front_radar_depth <= self._front_vehicle_emergency_distance:
+        if front_radar_depth <= profile["min_hold_distance_m"]:
             return self._sensor_close_brake
+        if profile["ttc_s"] is not None and profile["ttc_s"] <= self._front_vehicle_ttc_emergency_s:
+            return self._sensor_close_brake
+        if front_radar_depth <= profile["dynamic_emergency_distance_m"]:
+            return self._sensor_close_brake
+
+        ego_speed_value = 0.0 if ego_speed_mps is None else max(float(ego_speed_mps), 0.0)
+        if (
+            ego_speed_value <= self._front_vehicle_low_speed_mps
+            and front_radar_depth > profile["dynamic_stop_distance_m"] + 0.2
+        ):
+            return 0.0
 
         trigger_distance = max(
             self._front_radar_trigger_distance,
-            self._front_vehicle_emergency_distance + 0.1,
+            profile["dynamic_stop_distance_m"] + 1.2,
         )
-        distance_span = max(trigger_distance - self._front_vehicle_emergency_distance, 0.1)
-        closeness = (trigger_distance - front_radar_depth) / distance_span
-        closeness = float(np.clip(closeness, 0.0, 1.0))
+        distance_span = max(trigger_distance - profile["dynamic_stop_distance_m"], 0.1)
+        closeness = float(np.clip((trigger_distance - front_radar_depth) / distance_span, 0.0, 1.0))
+        ttc_pressure = 0.0
+        if profile["ttc_s"] is not None and profile["ttc_s"] < self._front_vehicle_ttc_brake_s:
+            ttc_span = max(
+                self._front_vehicle_ttc_brake_s - self._front_vehicle_ttc_emergency_s,
+                0.1,
+            )
+            ttc_pressure = float(
+                np.clip((self._front_vehicle_ttc_brake_s - profile["ttc_s"]) / ttc_span, 0.0, 1.0)
+            )
+        brake_pressure = max(closeness, ttc_pressure)
 
-        return self._sensor_soft_brake + closeness * (self._sensor_stop_brake - self._sensor_soft_brake)
+        return self._sensor_soft_brake + brake_pressure * (self._sensor_stop_brake - self._sensor_soft_brake)
 
-    def _apply_sensor_navigation(self, control, current_waypoint, front_vehicle_state, left_oncoming):
+    def _apply_sensor_navigation(self, control, current_waypoint, front_vehicle_state, left_oncoming, speed_mps=None):
+        self._set_safety_intervention(False, "", 0.0)
+        launch_assist_applied = False
         if self._overtake_state in ("follow_lane", "waiting_left"):
             if self._is_front_obstacle_active(front_vehicle_state):
-                brake_value = self._compute_front_obstacle_brake(front_vehicle_state)
-                return self._apply_brake_override(control, brake_value)
+                brake_value = self._compute_front_obstacle_brake(front_vehicle_state, ego_speed_mps=speed_mps)
+                brake_value = self._adjust_waiting_left_brake(
+                    brake_value,
+                    front_vehicle_state,
+                    ego_speed_mps=speed_mps,
+                )
+                if brake_value > 1e-3:
+                    self._set_safety_intervention(True, "front_obstacle", brake_value)
+                    return self._apply_brake_override(control, brake_value)
 
         if self._overtake_state == "changing_left" and current_waypoint is not None:
             if self._overtake_origin_lane_id is not None and current_waypoint.lane_id == self._overtake_origin_lane_id:
-                if front_vehicle_state["distance_m"] is not None and front_vehicle_state["distance_m"] < self._front_vehicle_emergency_distance:
-                    return self._apply_brake_override(control, self._sensor_close_brake)
+                if self._should_block_lane_change_for_front_obstacle(front_vehicle_state, ego_speed_mps=speed_mps):
+                    if self._should_apply_mpc_lane_change_launch_assist(
+                        control,
+                        current_waypoint,
+                        front_vehicle_state,
+                        ego_speed_mps=speed_mps,
+                    ):
+                        control = self._apply_mpc_lane_change_launch_assist(
+                            control,
+                            front_vehicle_state,
+                            ego_speed_mps=speed_mps,
+                        )
+                        launch_assist_applied = True
+                    else:
+                        self._set_safety_intervention(True, "front_emergency", self._sensor_close_brake)
+                        return self._apply_brake_override(control, self._sensor_close_brake)
 
         if self._overtake_state in ("changing_left", "passing"):
             if left_oncoming is not None:
                 self._log_overtake_fail_safe("left_oncoming", front_vehicle_state, left_oncoming)
+                self._set_safety_intervention(True, "left_oncoming", self._sensor_emergency_brake)
                 return self._apply_brake_override(control, self._sensor_emergency_brake)
 
             front_radar_depth = front_vehicle_state.get("front_radar_depth") if front_vehicle_state else None
@@ -621,8 +1310,137 @@ class MyAgent(AutonomousAgent):
                 and front_radar_velocity <= self._overtake_fail_safe_velocity
             ):
                 self._log_overtake_fail_safe("front_radar_closing", front_vehicle_state, left_oncoming)
+                self._set_safety_intervention(True, "front_radar_closing", self._sensor_emergency_brake)
                 return self._apply_brake_override(control, self._sensor_emergency_brake)
 
+        if launch_assist_applied:
+            self._set_safety_intervention(True, "mpc_lane_change_launch", 0.0)
+        return control
+
+    @staticmethod
+    def _get_front_clearance_m(front_vehicle_state):
+        if not front_vehicle_state:
+            return None
+
+        distance_candidates = []
+        for key in ("distance_m", "front_radar_depth"):
+            value = front_vehicle_state.get(key)
+            if value is not None:
+                distance_candidates.append(float(value))
+
+        if not distance_candidates:
+            return None
+        return min(distance_candidates)
+
+    def _should_apply_mpc_lane_change_launch_assist(
+        self,
+        control,
+        current_waypoint,
+        front_vehicle_state,
+        ego_speed_mps=None,
+    ):
+        if self._controller_mode != "mpc":
+            return False
+        if self._overtake_state != "changing_left":
+            return False
+        if self._overtake_started_at is None:
+            return False
+        if current_waypoint is None or self._overtake_origin_lane_id is None:
+            return False
+        if current_waypoint.lane_id != self._overtake_origin_lane_id:
+            return False
+        if not self._is_mpc_lane_change_launch_window_active():
+            return False
+        if abs(float(control.steer)) < self._mpc_lane_change_launch_min_steer:
+            return False
+
+        front_safety = self._build_front_safety_profile(front_vehicle_state, ego_speed_mps)
+        front_distance_m = front_safety["distance_m"]
+        if front_distance_m is None:
+            return False
+        launch_min_front_distance = max(
+            front_safety["min_hold_distance_m"] + 0.4,
+            min(
+                self._mpc_lane_change_launch_min_front_distance,
+                front_safety["dynamic_emergency_distance_m"],
+            ),
+        )
+        if front_distance_m < launch_min_front_distance:
+            return False
+
+        return True
+
+    def _adjust_waiting_left_brake(self, brake_value, front_vehicle_state, ego_speed_mps=None):
+        if self._controller_mode != "mpc":
+            return brake_value
+        if self._overtake_state != "waiting_left":
+            return brake_value
+
+        front_safety = self._build_front_safety_profile(front_vehicle_state, ego_speed_mps)
+        front_distance_m = self._get_front_clearance_m(front_vehicle_state)
+        if front_distance_m is None:
+            return brake_value
+
+        if (
+            front_safety["low_speed_restart_safe"]
+            and front_safety["dynamic_margin_m"] is not None
+            and front_safety["dynamic_margin_m"] > 0.2
+        ):
+            return min(float(brake_value), self._sensor_soft_brake)
+
+        dynamic_waiting_stop_distance = max(
+            self._mpc_waiting_left_close_stop_distance,
+            front_safety["dynamic_stop_distance_m"] + 0.2,
+        )
+        if front_distance_m <= dynamic_waiting_stop_distance:
+            return max(float(brake_value), self._mpc_waiting_left_close_stop_brake)
+        return brake_value
+
+    def _is_mpc_lane_change_launch_window_active(self):
+        if self._overtake_started_at is None:
+            return False
+        if self._current_timestamp - self._overtake_started_at <= self._mpc_lane_change_launch_grace_time:
+            return True
+        return self._is_ego_nearly_stationary(self._mpc_lane_change_resume_speed_mps)
+
+    def _is_ego_nearly_stationary(self, speed_threshold_mps):
+        hero_actor = self._hero_actor or self._get_hero_actor()
+        speed_mps = self._compute_speed_mps_from_actor(hero_actor)
+        if speed_mps is None:
+            return False
+        return speed_mps <= max(float(speed_threshold_mps), 0.0)
+
+    def _apply_mpc_lane_change_launch_assist(self, control, front_vehicle_state, ego_speed_mps=None):
+        launch_throttle = self._mpc_lane_change_launch_throttle
+        front_safety = self._build_front_safety_profile(front_vehicle_state, ego_speed_mps)
+        front_distance_m = front_safety["distance_m"]
+        if front_distance_m is not None:
+            launch_min_front_distance = max(
+                front_safety["min_hold_distance_m"] + 0.4,
+                min(
+                    self._mpc_lane_change_launch_min_front_distance,
+                    front_safety["dynamic_emergency_distance_m"],
+                ),
+            )
+            launch_max_front_distance = max(
+                launch_min_front_distance + 0.5,
+                front_safety["dynamic_stop_distance_m"] + 0.8,
+                self._mpc_lane_change_launch_min_front_distance,
+            )
+            available_span = max(launch_max_front_distance - launch_min_front_distance, 0.25)
+            clearance_ratio = np.clip(
+                (front_distance_m - launch_min_front_distance) / available_span,
+                0.0,
+                1.0,
+            )
+            launch_throttle = (
+                self._mpc_lane_change_launch_min_throttle
+                + clearance_ratio * (self._mpc_lane_change_launch_throttle - self._mpc_lane_change_launch_min_throttle)
+            )
+
+        control.brake = 0.0
+        control.throttle = max(float(control.throttle), float(launch_throttle))
+        control.hand_brake = False
         return control
 
     def _log_overtake_fail_safe(self, reason, front_vehicle_state, left_oncoming):
@@ -657,7 +1475,7 @@ class MyAgent(AutonomousAgent):
         return carla_map.get_waypoint(hero_actor.get_location(), lane_type=carla.LaneType.Driving)
 
     def _update_overtake_state(self, timestamp, speed_mps, front_vehicle_state, left_oncoming, rear_approaching):
-        del speed_mps  # Behavior is distance-driven for now.
+        del speed_mps
         current_waypoint = self._get_current_waypoint()
         if self._overtake_cooldown_until is not None and timestamp >= self._overtake_cooldown_until:
             self._overtake_cooldown_until = None
@@ -688,7 +1506,7 @@ class MyAgent(AutonomousAgent):
         elif self._overtake_state == "changing_right":
             self._rejoin_lane_clear_since = None
             if current_waypoint is not None and self._overtake_origin_lane_id is not None:
-                if current_waypoint.lane_id == self._overtake_origin_lane_id:
+                if self._is_rejoin_stabilized(current_waypoint):
                     self._right_lane_entered_at = (
                         timestamp if self._right_lane_entered_at is None else self._right_lane_entered_at
                     )
@@ -712,7 +1530,7 @@ class MyAgent(AutonomousAgent):
         if left_oncoming is not None:
             self._waiting_left_reason = "left_oncoming"
             return False
-        if rear_approaching is not None:
+        if rear_approaching is not None and rear_approaching.get("mode") not in ("releasing",):
             self._waiting_left_reason = "rear_approach"
             return False
 
@@ -734,7 +1552,7 @@ class MyAgent(AutonomousAgent):
                 current_waypoint,
                 [
                     {
-                        "distance_m": self._overtake_same_lane_distance,
+                        "distance_m": self._get_left_lane_change_same_lane_distance(),
                         "lane_mode": "base",
                         "road_option": RoadOption.LANEFOLLOW,
                     },
@@ -763,6 +1581,7 @@ class MyAgent(AutonomousAgent):
             self._overtake_state = "changing_left"
             self._agent.set_global_plan(plan)
             self._agent.set_target_speed(self._overtake_speed)
+            self._active_target_speed = self._overtake_speed
             return True
 
         if direction == "right":
@@ -816,6 +1635,7 @@ class MyAgent(AutonomousAgent):
             self._rejoin_lane_clear_since = None
             self._agent.set_global_plan(plan)
             self._agent.set_target_speed(self._overtake_speed)
+            self._active_target_speed = self._overtake_speed
             return True
 
         return False
@@ -836,6 +1656,11 @@ class MyAgent(AutonomousAgent):
             return False
 
         return True
+
+    def _get_left_lane_change_same_lane_distance(self):
+        if self._controller_mode == "mpc":
+            return self._mpc_overtake_same_lane_distance
+        return self._overtake_same_lane_distance
 
     def _update_rejoin_clear_state(self, current_waypoint, front_vehicle_state, timestamp):
         if self._is_rejoin_lane_clear(current_waypoint, front_vehicle_state):
@@ -876,6 +1701,7 @@ class MyAgent(AutonomousAgent):
 
         if self._agent is not None:
             self._agent.set_target_speed(self._target_speed)
+            self._active_target_speed = self._target_speed
 
         if using_helper_rejoin_plan:
             self._saved_route_plan = []
@@ -1343,11 +2169,18 @@ class MyAgent(AutonomousAgent):
         front_radar_velocity = None
         front_radar_count = 0
         front_radar_mean_abs_azimuth = None
+        front_radar_anchor_azimuth = None
+        front_relative_longitudinal_m = None
+        front_relative_lateral_m = None
         if front_radar_points is not None and len(front_radar_points) > 0:
             front_radar_depth = float(np.min(front_radar_points[:, 0]))
             front_radar_velocity = float(np.median(front_radar_points[:, 3]))
             front_radar_count = len(front_radar_points)
             front_radar_mean_abs_azimuth = float(np.mean(np.abs(front_radar_points[:, 2])))
+            anchor_point = front_radar_points[np.argmin(front_radar_points[:, 0])]
+            front_radar_anchor_azimuth = float(anchor_point[2])
+            front_relative_longitudinal_m = float(anchor_point[0] * np.cos(anchor_point[2]))
+            front_relative_lateral_m = float(anchor_point[0] * np.sin(anchor_point[2]))
 
         distance_m = front_radar_depth
         blocked = (
@@ -1369,6 +2202,9 @@ class MyAgent(AutonomousAgent):
             "front_radar_velocity": front_radar_velocity,
             "front_radar_count": front_radar_count,
             "front_radar_mean_abs_azimuth": front_radar_mean_abs_azimuth,
+            "front_radar_anchor_azimuth": front_radar_anchor_azimuth,
+            "front_relative_longitudinal_m": front_relative_longitudinal_m,
+            "front_relative_lateral_m": front_relative_lateral_m,
             "raw_front_radar_points": raw_front_radar_points,
         }
 
@@ -1459,11 +2295,18 @@ class MyAgent(AutonomousAgent):
         ]
         if len(approaching_candidates) > 0:
             nearest = approaching_candidates[np.argmin(approaching_candidates[:, 0])]
-            return {
-                "distance_m": float(nearest[0]),
-                "velocity_mps": float(nearest[3]),
-                "mode": "approaching",
-            }
+            closing_speed_mps = max(-float(nearest[3]), 0.0)
+            ttc_s = self._compute_ttc_s(float(nearest[0]), closing_speed_mps)
+            if float(nearest[0]) <= self._rear_approach_close_distance or (
+                ttc_s is not None and ttc_s <= self._rear_approach_ttc_threshold_s
+            ):
+                return {
+                    "distance_m": float(nearest[0]),
+                    "velocity_mps": float(nearest[3]),
+                    "closing_speed_mps": closing_speed_mps,
+                    "ttc_s": ttc_s,
+                    "mode": "approaching",
+                }
 
         occupied_candidates = valid_points[
             (valid_points[:, 0] <= self._rear_lane_occupied_distance)
@@ -1473,9 +2316,50 @@ class MyAgent(AutonomousAgent):
             return None
 
         nearest = occupied_candidates[np.argmin(occupied_candidates[:, 0])]
+        distance_m = float(nearest[0])
+        velocity_mps = float(nearest[3])
+        closing_speed_mps = max(-velocity_mps, 0.0)
+        ttc_s = self._compute_ttc_s(distance_m, closing_speed_mps)
+
+        if velocity_mps >= self._rear_lane_release_velocity_mps and distance_m >= self._rear_lane_release_distance:
+            return {
+                "distance_m": distance_m,
+                "velocity_mps": velocity_mps,
+                "closing_speed_mps": closing_speed_mps,
+                "ttc_s": ttc_s,
+                "mode": "releasing",
+            }
+
+        if (
+            distance_m > self._rear_lane_hold_distance
+            and closing_speed_mps <= self._rear_lane_release_closing_speed_mps
+            and (ttc_s is None or ttc_s >= self._rear_lane_release_ttc_s)
+        ):
+            return {
+                "distance_m": distance_m,
+                "velocity_mps": velocity_mps,
+                "closing_speed_mps": closing_speed_mps,
+                "ttc_s": ttc_s,
+                "mode": "releasing",
+            }
+
+        if (
+            closing_speed_mps >= abs(self._rear_approach_velocity)
+            and (distance_m <= self._rear_approach_close_distance or (ttc_s is not None and ttc_s <= self._rear_approach_ttc_threshold_s))
+        ):
+            return {
+                "distance_m": distance_m,
+                "velocity_mps": velocity_mps,
+                "closing_speed_mps": closing_speed_mps,
+                "ttc_s": ttc_s,
+                "mode": "approaching",
+            }
+
         return {
-            "distance_m": float(nearest[0]),
-            "velocity_mps": float(nearest[3]),
+            "distance_m": distance_m,
+            "velocity_mps": velocity_mps,
+            "closing_speed_mps": closing_speed_mps,
+            "ttc_s": ttc_s,
             "mode": "occupied",
         }
 
@@ -1568,10 +2452,18 @@ class MyAgent(AutonomousAgent):
         if rear_approaching is None:
             return "clear"
         mode = rear_approaching.get("mode", "approaching")
-        return "{} {:.1f}m {:.1f}m/s".format(
+        ttc_s = rear_approaching.get("ttc_s")
+        if ttc_s is None:
+            return "{} {:.1f}m {:.1f}m/s".format(
+                mode,
+                rear_approaching["distance_m"],
+                rear_approaching["velocity_mps"],
+            )
+        return "{} {:.1f}m {:.1f}m/s ttc={:.1f}s".format(
             mode,
             rear_approaching["distance_m"],
             rear_approaching["velocity_mps"],
+            ttc_s,
         )
 
 
@@ -1590,15 +2482,259 @@ class MyAgent(AutonomousAgent):
             max_vel=float(np.max(points[:, 3])),
         )
 
+    def _initialize_metrics_logger(self, path_to_conf_file):
+        if not self._metrics_enabled:
+            return
+
+        route_metadata = self.get_route_metadata()
+        run_label = self._metrics_run_label or route_metadata.get("route_id") or self._controller_name
+        try:
+            self._metrics_logger = MetricsLogger(
+                metrics_dir=self._metrics_dir,
+                controller_name=self._controller_name,
+                run_label=run_label,
+                metadata={
+                    "agent_entry_point": get_entry_point(),
+                    "config_path": path_to_conf_file,
+                    "controller_mode": self._controller_mode,
+                    "target_speed_kph": self._target_speed,
+                    "camera_width": self.camera_width,
+                    "camera_height": self.camera_height,
+                    "mpc_horizon_steps": self._mpc_horizon_steps if self._controller_mode == "mpc" else None,
+                    "mpc_prediction_dt": self._mpc_prediction_dt if self._controller_mode == "mpc" else None,
+                    "route_id": route_metadata.get("route_id"),
+                    "route_index": route_metadata.get("route_index"),
+                    "repetition_index": route_metadata.get("repetition_index"),
+                    "town": route_metadata.get("town"),
+                },
+                flush_interval=self._metrics_flush_interval,
+            )
+            print("[Metrics] Logging raw telemetry to {}".format(self._metrics_logger.frame_path))
+        except (OSError, ValueError) as exc:
+            self._metrics_logger = None
+            print("WARNING: Couldn't initialize metrics logger: {}".format(exc))
+
+    def _record_metrics(self, frame_id, speed_mps, current_waypoint, front_vehicle_state,
+                        rear_radar_points, rear_approaching, left_oncoming, control):
+        if self._metrics_logger is None:
+            return
+
+        hero_actor = self._hero_actor or self._get_hero_actor()
+        if hero_actor is None:
+            return
+
+        try:
+            transform = hero_actor.get_transform()
+            velocity = hero_actor.get_velocity()
+            acceleration = hero_actor.get_acceleration()
+            angular_velocity = hero_actor.get_angular_velocity()
+        except RuntimeError:
+            return
+
+        if current_waypoint is None:
+            current_waypoint = self._get_current_waypoint()
+
+        target_speed_mps = self._active_target_speed / 3.6 if self._active_target_speed is not None else None
+        longitudinal_accel_mps2, lateral_accel_mps2 = self._project_to_vehicle_axes(acceleration, transform)
+        lateral_error_m, heading_error_deg = self._compute_tracking_errors(current_waypoint, transform)
+        target_lane_metrics = self._compute_target_lane_tracking_metrics(current_waypoint, transform)
+        route_metadata = self.get_route_metadata()
+        rear_distance_m = None
+        if rear_radar_points is not None and len(rear_radar_points) > 0:
+            rear_distance_m = float(np.min(rear_radar_points[:, 0]))
+        front_distance_m = front_vehicle_state.get("distance_m") if front_vehicle_state else None
+        front_safety = self._build_front_safety_profile(front_vehicle_state, speed_mps)
+        front_distance_margin_m = (
+            front_distance_m - self._front_vehicle_emergency_distance
+            if front_distance_m is not None
+            else None
+        )
+        front_relative_lateral_m = front_vehicle_state.get("front_relative_lateral_m") if front_vehicle_state else None
+        front_relative_longitudinal_m = (
+            front_vehicle_state.get("front_relative_longitudinal_m") if front_vehicle_state else None
+        )
+
+        metrics_row = {
+            "route_id": route_metadata.get("route_id"),
+            "route_index": route_metadata.get("route_index"),
+            "repetition_index": route_metadata.get("repetition_index"),
+            "town": route_metadata.get("town"),
+            "frame": frame_id,
+            "timestamp": self._current_timestamp,
+            "controller": self._controller_name,
+            "controller_mode": self._controller_mode,
+            "controller_compute_time_ms": self._last_controller_diagnostics["compute_time_ms"],
+            "controller_status": self._last_controller_diagnostics["status"],
+            "controller_fallback": self._last_controller_diagnostics["fallback"],
+            "maneuver_state": self._overtake_state,
+            "waiting_left_reason": self._waiting_left_reason,
+            "speed_mps": speed_mps,
+            "speed_kph": speed_mps * 3.6 if speed_mps is not None else None,
+            "target_speed_mps": target_speed_mps,
+            "target_speed_kph": self._active_target_speed,
+            "speed_error_mps": (
+                target_speed_mps - speed_mps
+                if target_speed_mps is not None and speed_mps is not None
+                else None
+            ),
+            "steer": control.steer,
+            "throttle": control.throttle,
+            "brake": control.brake,
+            "x": transform.location.x,
+            "y": transform.location.y,
+            "z": transform.location.z,
+            "yaw_deg": transform.rotation.yaw,
+            "pitch_deg": transform.rotation.pitch,
+            "roll_deg": transform.rotation.roll,
+            "velocity_x": velocity.x,
+            "velocity_y": velocity.y,
+            "velocity_z": velocity.z,
+            "accel_x": acceleration.x,
+            "accel_y": acceleration.y,
+            "accel_z": acceleration.z,
+            "longitudinal_accel_mps2": longitudinal_accel_mps2,
+            "lateral_accel_mps2": lateral_accel_mps2,
+            "yaw_rate_dps": angular_velocity.z,
+            "road_id": current_waypoint.road_id if current_waypoint is not None else None,
+            "lane_id": current_waypoint.lane_id if current_waypoint is not None else None,
+            "target_lane_id": self._get_target_lane_id_for_metrics(current_waypoint),
+            "target_lane_lateral_error_m": target_lane_metrics.get("lateral_error_m"),
+            "target_lane_heading_error_deg": target_lane_metrics.get("heading_error_deg"),
+            "target_lane_progress": target_lane_metrics.get("progress"),
+            "overtake_origin_lane_id": self._overtake_origin_lane_id,
+            "is_junction": current_waypoint.is_junction if current_waypoint is not None else None,
+            "front_distance_m": front_distance_m,
+            "front_distance_margin_m": front_distance_margin_m,
+            "front_dynamic_stop_distance_m": front_safety["dynamic_stop_distance_m"],
+            "front_dynamic_emergency_distance_m": front_safety["dynamic_emergency_distance_m"],
+            "front_dynamic_margin_m": front_safety["dynamic_margin_m"],
+            "front_ttc_s": front_safety["ttc_s"],
+            "front_closing_speed_mps": front_vehicle_state.get("front_radar_velocity") if front_vehicle_state else None,
+            "front_radar_point_count": front_vehicle_state.get("front_radar_count") if front_vehicle_state else None,
+            "front_radar_mean_abs_azimuth_rad": (
+                front_vehicle_state.get("front_radar_mean_abs_azimuth") if front_vehicle_state else None
+            ),
+            "front_radar_anchor_azimuth_rad": (
+                front_vehicle_state.get("front_radar_anchor_azimuth") if front_vehicle_state else None
+            ),
+            "front_relative_longitudinal_m": front_relative_longitudinal_m,
+            "front_relative_lateral_m": front_relative_lateral_m,
+            "front_relative_lateral_abs_m": (
+                abs(front_relative_lateral_m) if front_relative_lateral_m is not None else None
+            ),
+            "front_blocked": front_vehicle_state.get("blocked") if front_vehicle_state else False,
+            "rear_distance_m": rear_distance_m,
+            "rear_approach_distance_m": rear_approaching.get("distance_m") if rear_approaching else None,
+            "rear_approach_speed_mps": rear_approaching.get("velocity_mps") if rear_approaching else None,
+            "rear_closing_speed_mps": rear_approaching.get("closing_speed_mps") if rear_approaching else None,
+            "rear_approach_ttc_s": rear_approaching.get("ttc_s") if rear_approaching else None,
+            "rear_approach_mode": rear_approaching.get("mode", "none") if rear_approaching else "none",
+            "rear_lane_releasing": rear_approaching is not None and rear_approaching.get("mode") == "releasing",
+            "left_oncoming_detected": left_oncoming is not None,
+            "left_oncoming_confidence": left_oncoming.get("confidence") if left_oncoming else None,
+            "left_oncoming_label": left_oncoming.get("label") if left_oncoming else None,
+            "lateral_error_m": lateral_error_m,
+            "heading_error_deg": heading_error_deg,
+            "blocked_vehicle": self._is_front_obstacle_active(front_vehicle_state),
+            "rejoin_lane_clear": self._rejoin_lane_clear_since is not None,
+            "safety_override": self._last_safety_intervention["override"],
+            "safety_override_reason": self._last_safety_intervention["reason"],
+            "requested_brake": self._last_safety_intervention["requested_brake"],
+            "emergency_brake": self._last_safety_intervention["requested_brake"] >= self._sensor_emergency_brake,
+            "steer_saturated": abs(float(control.steer)) >= 0.75,
+            "front_collision_risk": front_safety["collision_risk"],
+        }
+
+        try:
+            self._metrics_logger.log_frame(metrics_row)
+        except OSError as exc:
+            print("WARNING: Failed to write metrics row: {}".format(exc))
+            self._metrics_logger = None
+
+    def _get_target_lane_id_for_metrics(self, current_waypoint):
+        if current_waypoint is None:
+            return self._overtake_origin_lane_id
+
+        if self._overtake_state == "changing_right":
+            return self._overtake_origin_lane_id
+
+        if self._overtake_state in ("waiting_left", "changing_left"):
+            adjacent_waypoint = self._get_adjacent_driving_lane(current_waypoint, "left")
+            if adjacent_waypoint is not None:
+                return adjacent_waypoint.lane_id
+
+        return current_waypoint.lane_id
+
+    @staticmethod
+    def _project_to_vehicle_axes(vector, transform):
+        if vector is None or transform is None:
+            return None, None
+
+        forward_vector = transform.get_forward_vector()
+        right_vector = transform.get_right_vector()
+        vector_np = np.array([vector.x, vector.y, vector.z], dtype=np.float64)
+        forward_np = np.array([forward_vector.x, forward_vector.y, forward_vector.z], dtype=np.float64)
+        right_np = np.array([right_vector.x, right_vector.y, right_vector.z], dtype=np.float64)
+
+        return float(np.dot(vector_np, forward_np)), float(np.dot(vector_np, right_np))
+
+    def _compute_tracking_errors(self, current_waypoint, ego_transform):
+        if current_waypoint is None or ego_transform is None:
+            return None, None
+
+        waypoint_location = current_waypoint.transform.location
+        ego_location = ego_transform.location
+        delta = np.array(
+            [
+                ego_location.x - waypoint_location.x,
+                ego_location.y - waypoint_location.y,
+                ego_location.z - waypoint_location.z,
+            ],
+            dtype=np.float64,
+        )
+        right_vector = current_waypoint.transform.get_right_vector()
+        right_np = np.array([right_vector.x, right_vector.y, right_vector.z], dtype=np.float64)
+        lateral_error_m = float(np.dot(delta, right_np))
+        heading_error_deg = self._normalize_angle_deg(
+            ego_transform.rotation.yaw - current_waypoint.transform.rotation.yaw
+        )
+
+        return lateral_error_m, heading_error_deg
+
+    @staticmethod
+    def _normalize_angle_deg(angle_deg):
+        return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+    def _set_safety_intervention(self, override, reason, requested_brake):
+        self._last_safety_intervention = {
+            "override": bool(override),
+            "reason": reason or "",
+            "requested_brake": float(requested_brake or 0.0),
+        }
+
     def destroy(self):
         """
         Cleanup agent state.
         """
+        if getattr(self, "_metrics_logger", None) is not None:
+            self._metrics_logger.close(
+                extra_summary={
+                    "route_id": self.get_route_metadata().get("route_id"),
+                    "route_index": self.get_route_metadata().get("route_index"),
+                    "repetition_index": self.get_route_metadata().get("repetition_index"),
+                    "town": self.get_route_metadata().get("town"),
+                    "final_state": self._overtake_state,
+                    "target_speed_kph": self._target_speed,
+                    "active_target_speed_kph": self._active_target_speed,
+                }
+            )
+            self._metrics_logger = None
         if hasattr(self, "_display") and self._display is not None:
             self._display.close()
             self._display = None
         self._agent = None
         self._hero_actor = None
+        self._mpc_controller = None
         self._route_assigned = False
 
     def _load_config(self, path_to_conf_file):
@@ -1618,6 +2754,125 @@ class MyAgent(AutonomousAgent):
                     if key == "target_speed":
                         self._target_speed = float(value)
                         self._overtake_speed = min(max(self._target_speed, 15.0), 25.0)
+                    elif key == "controller_mode":
+                        self._controller_mode = value or self._controller_mode
+                        self._controller_mode_explicit = True
+                    elif key == "controller_name":
+                        self._controller_name = value or self._controller_name
+                    elif key == "mpc_horizon_steps":
+                        self._mpc_horizon_steps = max(int(value), 4)
+                    elif key == "mpc_prediction_dt":
+                        self._mpc_prediction_dt = max(float(value), 1e-3)
+                    elif key == "mpc_wheel_base_m":
+                        self._mpc_wheel_base_m = max(float(value), 0.5)
+                    elif key == "mpc_max_steer_delta_per_cycle":
+                        self._mpc_max_steer_delta_per_cycle = max(float(value), 0.01)
+                    elif key == "mpc_max_steer_angle_deg":
+                        self._mpc_max_steer_angle_deg = max(float(value), 1.0)
+                    elif key == "mpc_follow_steer_step_limit":
+                        self._mpc_follow_steer_step_limit = max(float(value), 0.01)
+                    elif key == "mpc_lane_change_steer_step_limit":
+                        self._mpc_lane_change_steer_step_limit = max(float(value), 0.01)
+                    elif key == "mpc_same_lane_change_steer_limit":
+                        self._mpc_same_lane_change_steer_limit = min(max(float(value), 0.1), 1.0)
+                    elif key == "mpc_close_front_steer_limit":
+                        self._mpc_close_front_steer_limit = min(max(float(value), 0.1), 1.0)
+                    elif key == "mpc_lane_change_commitment_min_steer":
+                        self._mpc_lane_change_commitment_min_steer = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_lane_change_commitment_release_lateral_m":
+                        self._mpc_lane_change_commitment_release_lateral_m = max(float(value), 0.0)
+                    elif key == "mpc_lane_change_commitment_release_distance_m":
+                        self._mpc_lane_change_commitment_release_distance_m = max(float(value), 0.0)
+                    elif key == "mpc_left_release_speed_mps":
+                        self._mpc_left_release_speed_mps = max(float(value), 0.0)
+                    elif key == "mpc_left_release_heading_deg":
+                        self._mpc_left_release_heading_deg = max(float(value), 0.0)
+                    elif key == "mpc_left_release_lateral_error_m":
+                        self._mpc_left_release_lateral_error_m = max(float(value), 0.0)
+                    elif key == "mpc_left_release_progress":
+                        self._mpc_left_release_progress = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_left_release_max_steer":
+                        self._mpc_left_release_max_steer = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_left_final_release_speed_mps":
+                        self._mpc_left_final_release_speed_mps = max(float(value), 0.0)
+                    elif key == "mpc_left_final_release_heading_deg":
+                        self._mpc_left_final_release_heading_deg = max(float(value), 0.0)
+                    elif key == "mpc_left_final_release_lateral_error_m":
+                        self._mpc_left_final_release_lateral_error_m = max(float(value), 0.0)
+                    elif key == "mpc_left_final_release_progress":
+                        self._mpc_left_final_release_progress = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_left_final_release_max_steer":
+                        self._mpc_left_final_release_max_steer = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_rejoin_steer_limit":
+                        self._mpc_rejoin_steer_limit = min(max(float(value), 0.05), 1.0)
+                    elif key == "mpc_rejoin_soft_heading_deg":
+                        self._mpc_rejoin_soft_heading_deg = max(float(value), 0.0)
+                    elif key == "mpc_rejoin_soft_lateral_error_m":
+                        self._mpc_rejoin_soft_lateral_error_m = max(float(value), 0.0)
+                    elif key == "mpc_rejoin_hard_heading_deg":
+                        self._mpc_rejoin_hard_heading_deg = max(float(value), 0.0)
+                    elif key == "mpc_rejoin_hard_lateral_error_m":
+                        self._mpc_rejoin_hard_lateral_error_m = max(float(value), 0.0)
+                    elif key == "mpc_rejoin_finish_max_heading_error_deg":
+                        self._mpc_rejoin_finish_max_heading_error_deg = max(float(value), 0.0)
+                    elif key == "mpc_rejoin_finish_max_lateral_error_m":
+                        self._mpc_rejoin_finish_max_lateral_error_m = max(float(value), 0.0)
+                    elif key == "mpc_rejoin_finish_max_abs_steer":
+                        self._mpc_rejoin_finish_max_abs_steer = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_overtake_same_lane_distance":
+                        self._mpc_overtake_same_lane_distance = max(float(value), 0.0)
+                    elif key == "mpc_waiting_left_close_stop_distance":
+                        self._mpc_waiting_left_close_stop_distance = max(float(value), 0.0)
+                    elif key == "mpc_waiting_left_close_stop_brake":
+                        self._mpc_waiting_left_close_stop_brake = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_lane_change_launch_grace_time":
+                        self._mpc_lane_change_launch_grace_time = max(float(value), 0.0)
+                    elif key == "mpc_lane_change_launch_min_front_distance":
+                        self._mpc_lane_change_launch_min_front_distance = max(float(value), 0.0)
+                    elif key == "mpc_lane_change_launch_min_steer":
+                        self._mpc_lane_change_launch_min_steer = max(float(value), 0.0)
+                    elif key == "mpc_lane_change_launch_min_throttle":
+                        self._mpc_lane_change_launch_min_throttle = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_lane_change_launch_throttle":
+                        self._mpc_lane_change_launch_throttle = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_lane_change_resume_speed_mps":
+                        self._mpc_lane_change_resume_speed_mps = max(float(value), 0.0)
+                    elif key == "front_vehicle_min_hold_distance":
+                        self._front_vehicle_min_hold_distance = max(float(value), 0.5)
+                    elif key == "front_vehicle_reaction_time_s":
+                        self._front_vehicle_reaction_time_s = max(float(value), 0.0)
+                    elif key == "front_vehicle_comfort_decel_mps2":
+                        self._front_vehicle_comfort_decel_mps2 = max(float(value), 0.5)
+                    elif key == "front_vehicle_low_speed_mps":
+                        self._front_vehicle_low_speed_mps = max(float(value), 0.0)
+                    elif key == "front_vehicle_restart_speed_mps":
+                        self._front_vehicle_restart_speed_mps = max(float(value), 0.0)
+                    elif key == "front_vehicle_ttc_brake_s":
+                        self._front_vehicle_ttc_brake_s = max(float(value), 0.1)
+                    elif key == "front_vehicle_ttc_emergency_s":
+                        self._front_vehicle_ttc_emergency_s = max(float(value), 0.1)
+                    elif key == "rear_approach_ttc_threshold_s":
+                        self._rear_approach_ttc_threshold_s = max(float(value), 0.1)
+                    elif key == "rear_approach_close_distance":
+                        self._rear_approach_close_distance = max(float(value), 0.0)
+                    elif key == "rear_lane_hold_distance":
+                        self._rear_lane_hold_distance = max(float(value), 0.0)
+                    elif key == "rear_lane_release_distance":
+                        self._rear_lane_release_distance = max(float(value), 0.0)
+                    elif key == "rear_lane_release_velocity_mps":
+                        self._rear_lane_release_velocity_mps = float(value)
+                    elif key == "rear_lane_release_closing_speed_mps":
+                        self._rear_lane_release_closing_speed_mps = max(float(value), 0.0)
+                    elif key == "rear_lane_release_ttc_s":
+                        self._rear_lane_release_ttc_s = max(float(value), 0.1)
+                    elif key == "metrics_enabled":
+                        self._metrics_enabled = value.lower() in ("1", "true", "yes", "on")
+                    elif key == "metrics_dir":
+                        self._metrics_dir = value or self._metrics_dir
+                    elif key in ("metrics_run_label", "run_label"):
+                        self._metrics_run_label = value
+                    elif key == "metrics_flush_interval":
+                        self._metrics_flush_interval = max(int(value), 1)
         except OSError:
             print("WARNING: Couldn't read agent config file '{}'".format(path_to_conf_file))
         except ValueError as exc:
