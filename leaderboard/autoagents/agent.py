@@ -19,7 +19,7 @@ from agents.navigation.local_planner import RoadOption
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
-from leaderboard.autoagents.mpc_controller import LateralMPCController
+from leaderboard.autoagents.mpc_controller import LateralMPCController, LongitudinalMPCController
 from leaderboard.metrics.metrics_logger import MetricsLogger
 
 try:
@@ -264,8 +264,12 @@ class MyAgent(AutonomousAgent):
             "requested_brake": 0.0,
         }
         self._last_controller_diagnostics = self._make_controller_diagnostics(status="basic_agent_pid")
+        self._last_longitudinal_controller_diagnostics = self._make_controller_diagnostics(
+            status="basic_agent_longitudinal"
+        )
         self._basic_agent_hazard_brake_threshold = 0.49
         self._mpc_controller = None
+        self._mpc_longitudinal_controller = None
         self._mpc_horizon_steps = 12
         self._mpc_prediction_dt = 0.10
         self._mpc_wheel_base_m = 2.875
@@ -336,7 +340,7 @@ class MyAgent(AutonomousAgent):
         self._rejoin_radar_min_forward_distance = 1.5
         self._rejoin_radar_min_points = 2
         self._rejoin_lane_lateral_margin = 1.5
-        self._rejoin_clear_hold_time = 0.4
+        self._rejoin_clear_hold_time = 0.8
         self._front_vehicle_min_confidence = 0.45
         self._front_vehicle_center_x_min = 0.30
         self._front_vehicle_center_x_max = 0.70
@@ -371,17 +375,30 @@ class MyAgent(AutonomousAgent):
         self._mpc_overtake_same_lane_distance = 0.8
         self._mpc_waiting_left_close_stop_distance = 6.4
         self._mpc_waiting_left_close_stop_brake = 0.78
+        self._mpc_waiting_left_oncoming_extra_stop_buffer_m = 1.35
         self._mpc_lane_change_launch_grace_time = 1.0
         self._mpc_lane_change_launch_min_front_distance = 4.0
         self._mpc_lane_change_launch_min_steer = 0.20
-        self._mpc_lane_change_launch_min_throttle = 0.12
-        self._mpc_lane_change_launch_throttle = 0.18
+        self._mpc_lane_change_launch_min_throttle = 0.20
+        self._mpc_lane_change_launch_throttle = 0.30
         self._mpc_lane_change_resume_speed_mps = 0.25
+        self._mpc_longitudinal_horizon_steps = 10
+        self._mpc_longitudinal_prediction_dt = 0.20
+        self._mpc_longitudinal_max_accel_mps2 = 2.2
+        self._mpc_longitudinal_max_decel_mps2 = 4.8
+        self._mpc_longitudinal_max_accel_delta_per_cycle = 0.85
+        self._mpc_longitudinal_stop_buffer_m = 0.45
+        self._mpc_waiting_left_target_speed_mps = 0.0
+        self._mpc_waiting_left_creep_speed_mps = 0.65
+        self._mpc_changing_left_target_speed_mps = 0.0
+        self._mpc_passing_target_speed_mps = 0.0
+        self._mpc_changing_right_target_speed_mps = 0.0
+        self._last_mpc_longitudinal_accel_cmd = 0.0
         self._return_same_lane_distance = 4.0
         self._return_lane_change_distance = 8.0
         self._return_other_lane_distance = 8.0
         self._min_left_lane_time = 1.5
-        self._min_right_lane_settle_time = 0.8
+        self._min_right_lane_settle_time = 0.4
         self._post_overtake_cooldown_time = 2.0
         self._route_rejoin_min_distance = 8.0
         self._front_collision_risk_distance = 4.5
@@ -648,27 +665,307 @@ class MyAgent(AutonomousAgent):
             candidate_count=candidate_count,
         )
 
-    def _ensure_runtime_controller(self):
-        if self._controller_mode != "mpc" or self._mpc_controller is not None:
-            return
-
-        self._mpc_controller = LateralMPCController(
-            horizon_steps=self._mpc_horizon_steps,
-            prediction_dt=self._mpc_prediction_dt,
-            wheel_base_m=self._mpc_wheel_base_m,
-            max_steer_delta_per_cycle=self._mpc_max_steer_delta_per_cycle,
-            max_steer_angle_deg=self._mpc_max_steer_angle_deg,
+    def _set_longitudinal_controller_diagnostics(
+        self,
+        compute_time_ms=0.0,
+        fallback=False,
+        status="",
+        reference_count=0,
+        candidate_count=0,
+    ):
+        self._last_longitudinal_controller_diagnostics = self._make_controller_diagnostics(
+            compute_time_ms=compute_time_ms,
+            fallback=fallback,
+            status=status,
+            reference_count=reference_count,
+            candidate_count=candidate_count,
         )
 
-    def _run_selected_controller(self, speed_mps, current_waypoint=None, front_vehicle_state=None):
-        base_control = self._agent.run_step()
+    def _ensure_runtime_controller(self):
         if self._controller_mode != "mpc":
+            return
+
+        if self._mpc_controller is None:
+            self._mpc_controller = LateralMPCController(
+                horizon_steps=self._mpc_horizon_steps,
+                prediction_dt=self._mpc_prediction_dt,
+                wheel_base_m=self._mpc_wheel_base_m,
+                max_steer_delta_per_cycle=self._mpc_max_steer_delta_per_cycle,
+                max_steer_angle_deg=self._mpc_max_steer_angle_deg,
+            )
+
+        if self._mpc_longitudinal_controller is None:
+            self._mpc_longitudinal_controller = LongitudinalMPCController(
+                horizon_steps=self._mpc_longitudinal_horizon_steps,
+                prediction_dt=self._mpc_longitudinal_prediction_dt,
+                max_accel_mps2=self._mpc_longitudinal_max_accel_mps2,
+                max_decel_mps2=self._mpc_longitudinal_max_decel_mps2,
+                max_accel_delta_per_cycle=self._mpc_longitudinal_max_accel_delta_per_cycle,
+                stop_buffer_m=self._mpc_longitudinal_stop_buffer_m,
+            )
+
+    def _set_agent_target_speed(self, target_speed_kph):
+        target_speed_kph = max(float(target_speed_kph or 0.0), 0.0)
+        if self._agent is not None and (
+            self._active_target_speed is None
+            or abs(float(self._active_target_speed) - target_speed_kph) > 1e-3
+        ):
+            self._agent.set_target_speed(target_speed_kph)
+        self._active_target_speed = target_speed_kph
+
+    def _estimate_control_acceleration_hint(self, throttle, brake):
+        throttle_value = float(np.clip(throttle, 0.0, 1.0))
+        brake_value = float(np.clip(brake, 0.0, 1.0))
+        return (
+            throttle_value * self._mpc_longitudinal_max_accel_mps2
+            - brake_value * self._mpc_longitudinal_max_decel_mps2
+        )
+
+    def _estimate_front_actor_speed_mps(self, front_vehicle_state, ego_speed_mps=None):
+        if front_vehicle_state is None:
+            return None
+
+        ego_speed_value = 0.0 if ego_speed_mps is None else max(float(ego_speed_mps), 0.0)
+        raw_front_velocity = front_vehicle_state.get("front_radar_velocity")
+        if raw_front_velocity is None or not np.isfinite(raw_front_velocity):
+            return None
+        return max(ego_speed_value + float(raw_front_velocity), 0.0)
+
+    def _resolve_mpc_phase_speed_target_mps(self, phase_name, base_target_mps, overtake_target_mps):
+        if phase_name == "waiting_left":
+            if self._mpc_waiting_left_target_speed_mps > 1e-3:
+                return self._mpc_waiting_left_target_speed_mps
+            return max(1.2, min(base_target_mps * 0.58, 3.2))
+
+        if phase_name == "changing_left":
+            if self._mpc_changing_left_target_speed_mps > 1e-3:
+                return self._mpc_changing_left_target_speed_mps
+            return max(2.0, min(overtake_target_mps * 0.82, 4.6))
+
+        if phase_name == "passing":
+            if self._mpc_passing_target_speed_mps > 1e-3:
+                return self._mpc_passing_target_speed_mps
+            return max(overtake_target_mps, base_target_mps)
+
+        if phase_name == "changing_right":
+            if self._mpc_changing_right_target_speed_mps > 1e-3:
+                return self._mpc_changing_right_target_speed_mps
+            return max(2.6, min(max(base_target_mps, overtake_target_mps * 0.88), overtake_target_mps))
+
+        return base_target_mps
+
+    def _build_mpc_longitudinal_reference(self, speed_mps, current_waypoint, front_vehicle_state):
+        if self._controller_mode != "mpc":
+            return None
+        if self._overtake_state not in ("waiting_left", "changing_left", "passing", "changing_right"):
+            return None
+
+        speed_value = 0.0 if speed_mps is None else max(float(speed_mps), 0.0)
+        base_target_mps = max(float(self._target_speed) / 3.6, 0.0)
+        overtake_target_mps = max(float(self._overtake_speed) / 3.6, 0.0)
+        front_safety = self._build_front_safety_profile(front_vehicle_state, speed_value)
+        front_distance_m = front_safety["distance_m"]
+        front_speed_mps = self._estimate_front_actor_speed_mps(front_vehicle_state, speed_value)
+        target_speed_mps = base_target_mps
+        status = self._overtake_state
+
+        if self._overtake_state == "waiting_left":
+            waiting_cap_mps = self._resolve_mpc_phase_speed_target_mps(
+                "waiting_left",
+                base_target_mps,
+                overtake_target_mps,
+            )
+            target_speed_mps = waiting_cap_mps
+            if front_distance_m is not None:
+                safe_stop_distance_m = front_safety["dynamic_stop_distance_m"] + self._mpc_longitudinal_stop_buffer_m
+                if self._waiting_left_reason == "left_oncoming":
+                    safe_stop_distance_m += self._mpc_waiting_left_oncoming_extra_stop_buffer_m
+                free_distance_m = max(front_distance_m - safe_stop_distance_m, 0.0)
+                approach_speed_mps = float(
+                    np.sqrt(max(2.0 * self._front_vehicle_comfort_decel_mps2 * free_distance_m, 0.0))
+                )
+                target_speed_mps = min(waiting_cap_mps, approach_speed_mps)
+                if (
+                    self._waiting_left_reason != "left_oncoming"
+                    and (
+                        front_safety["low_speed_restart_safe"]
+                        and front_safety["dynamic_margin_m"] is not None
+                        and front_safety["dynamic_margin_m"] > 0.2
+                    )
+                ):
+                    target_speed_mps = max(target_speed_mps, min(self._mpc_waiting_left_creep_speed_mps, waiting_cap_mps))
+            status = "waiting_left_{}".format(self._waiting_left_reason)
+
+        elif self._overtake_state == "changing_left":
+            same_lane_change = (
+                current_waypoint is not None
+                and self._overtake_origin_lane_id is not None
+                and current_waypoint.lane_id == self._overtake_origin_lane_id
+            )
+            change_left_target_mps = self._resolve_mpc_phase_speed_target_mps(
+                "changing_left",
+                base_target_mps,
+                overtake_target_mps,
+            )
+            target_speed_mps = change_left_target_mps
+            if same_lane_change and front_distance_m is not None:
+                launch_min_front_distance = max(
+                    front_safety["min_hold_distance_m"] + 0.4,
+                    min(
+                        self._mpc_lane_change_launch_min_front_distance,
+                        front_safety["dynamic_emergency_distance_m"],
+                    ),
+                )
+                launch_free_distance = max(
+                    launch_min_front_distance + 1.5,
+                    front_safety["dynamic_stop_distance_m"] + 1.0,
+                )
+                available_span = max(launch_free_distance - launch_min_front_distance, 0.25)
+                clearance_ratio = float(
+                    np.clip((front_distance_m - launch_min_front_distance) / available_span, 0.0, 1.0)
+                )
+                minimum_launch_speed_mps = max(self._mpc_lane_change_resume_speed_mps, 0.6)
+                target_speed_mps = minimum_launch_speed_mps + clearance_ratio * (
+                    change_left_target_mps - minimum_launch_speed_mps
+                )
+                if self._is_mpc_lane_change_launch_window_active():
+                    target_speed_mps = max(target_speed_mps, minimum_launch_speed_mps)
+                status = "changing_left_same_lane"
+            else:
+                target_speed_mps = max(
+                    change_left_target_mps,
+                    self._resolve_mpc_phase_speed_target_mps("passing", base_target_mps, overtake_target_mps) * 0.92,
+                )
+                status = "changing_left_committed"
+
+        elif self._overtake_state == "passing":
+            target_speed_mps = self._resolve_mpc_phase_speed_target_mps(
+                "passing",
+                base_target_mps,
+                overtake_target_mps,
+            )
+            status = "passing"
+
+        elif self._overtake_state == "changing_right":
+            target_speed_mps = self._resolve_mpc_phase_speed_target_mps(
+                "changing_right",
+                base_target_mps,
+                overtake_target_mps,
+            )
+            status = "changing_right"
+
+        target_speed_mps = max(float(target_speed_mps), 0.0)
+        return {
+            "target_speed_mps": target_speed_mps,
+            "front_distance_m": front_distance_m,
+            "front_speed_mps": front_speed_mps,
+            "dynamic_stop_distance_m": front_safety["dynamic_stop_distance_m"],
+            "dynamic_emergency_distance_m": front_safety["dynamic_emergency_distance_m"],
+            "ttc_threshold_s": self._front_vehicle_ttc_brake_s,
+            "status": status,
+        }
+
+    def _apply_mpc_longitudinal_control(
+        self,
+        control,
+        speed_mps,
+        current_control,
+        longitudinal_reference,
+    ):
+        if longitudinal_reference is None:
+            self._last_mpc_longitudinal_accel_cmd = 0.0
+            self._set_longitudinal_controller_diagnostics(status="basic_agent_longitudinal")
+            return control
+
+        self._ensure_runtime_controller()
+        if self._mpc_longitudinal_controller is None:
+            self._last_mpc_longitudinal_accel_cmd = self._estimate_control_acceleration_hint(
+                control.throttle,
+                control.brake,
+            )
+            self._set_longitudinal_controller_diagnostics(
+                fallback=True,
+                status="mpc_longitudinal_unavailable",
+            )
+            return control
+
+        current_accel_hint = 0.0
+        if current_control is not None:
+            current_accel_hint = self._estimate_control_acceleration_hint(
+                current_control.throttle,
+                current_control.brake,
+            )
+
+        start_time = time.perf_counter()
+        try:
+            result = self._mpc_longitudinal_controller.compute_control(
+                speed_mps=speed_mps,
+                target_speed_mps=longitudinal_reference["target_speed_mps"],
+                current_accel_cmd=current_accel_hint,
+                front_distance_m=longitudinal_reference["front_distance_m"],
+                front_speed_mps=longitudinal_reference["front_speed_mps"],
+                dynamic_stop_distance_m=longitudinal_reference["dynamic_stop_distance_m"],
+                dynamic_emergency_distance_m=longitudinal_reference["dynamic_emergency_distance_m"],
+                ttc_threshold_s=longitudinal_reference["ttc_threshold_s"],
+                fallback_throttle=control.throttle,
+                fallback_brake=control.brake,
+            )
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            print("WARNING: MPC longitudinal controller failed: {}".format(exc))
+            self._last_mpc_longitudinal_accel_cmd = self._estimate_control_acceleration_hint(
+                control.throttle,
+                control.brake,
+            )
+            self._set_longitudinal_controller_diagnostics(
+                compute_time_ms=elapsed_ms,
+                fallback=True,
+                status="mpc_longitudinal_exception",
+            )
+            return control
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        self._last_mpc_longitudinal_accel_cmd = float(result.acceleration_mps2)
+        self._set_longitudinal_controller_diagnostics(
+            compute_time_ms=elapsed_ms,
+            fallback=False,
+            status=longitudinal_reference["status"] + ":" + result.status,
+            reference_count=1,
+            candidate_count=result.candidate_count,
+        )
+        control.throttle = float(result.throttle)
+        control.brake = float(result.brake)
+        control.hand_brake = False
+        return control
+
+    def _run_selected_controller(self, speed_mps, current_waypoint=None, front_vehicle_state=None):
+        if self._controller_mode != "mpc":
+            base_control = self._agent.run_step()
             self._set_controller_diagnostics(status="basic_agent_pid")
+            self._set_longitudinal_controller_diagnostics(status="basic_agent_longitudinal")
             return base_control
+
+        longitudinal_reference = self._build_mpc_longitudinal_reference(
+            speed_mps,
+            current_waypoint,
+            front_vehicle_state,
+        )
+        if longitudinal_reference is not None:
+            self._set_agent_target_speed(longitudinal_reference["target_speed_mps"] * 3.6)
+        else:
+            self._set_agent_target_speed(self._target_speed)
+            self._set_longitudinal_controller_diagnostics(status="basic_agent_longitudinal")
+
+        base_control = self._agent.run_step()
 
         self._ensure_runtime_controller()
         if self._mpc_controller is None:
             self._set_controller_diagnostics(fallback=True, status="mpc_unavailable")
+            if longitudinal_reference is not None:
+                self._set_longitudinal_controller_diagnostics(
+                    fallback=True,
+                    status=longitudinal_reference["status"] + ":mpc_unavailable",
+                )
             return base_control
 
         if (
@@ -676,17 +973,32 @@ class MyAgent(AutonomousAgent):
             and base_control.throttle <= 1e-3
         ):
             self._set_controller_diagnostics(fallback=True, status="basic_agent_hazard_stop")
+            if longitudinal_reference is not None:
+                self._set_longitudinal_controller_diagnostics(
+                    fallback=True,
+                    status=longitudinal_reference["status"] + ":basic_agent_hazard_stop",
+                )
             return base_control
 
         local_planner = self._agent.get_local_planner()
         plan = list(local_planner.get_plan()) if local_planner is not None else []
         if not plan:
             self._set_controller_diagnostics(fallback=True, status="planner_empty")
+            if longitudinal_reference is not None:
+                self._set_longitudinal_controller_diagnostics(
+                    fallback=True,
+                    status=longitudinal_reference["status"] + ":planner_empty",
+                )
             return base_control
 
         hero_actor = self._hero_actor or self._get_hero_actor()
         if hero_actor is None:
             self._set_controller_diagnostics(fallback=True, status="hero_unavailable")
+            if longitudinal_reference is not None:
+                self._set_longitudinal_controller_diagnostics(
+                    fallback=True,
+                    status=longitudinal_reference["status"] + ":hero_unavailable",
+                )
             return base_control
 
         try:
@@ -694,6 +1006,11 @@ class MyAgent(AutonomousAgent):
             current_control = hero_actor.get_control()
         except RuntimeError:
             self._set_controller_diagnostics(fallback=True, status="hero_state_unavailable")
+            if longitudinal_reference is not None:
+                self._set_longitudinal_controller_diagnostics(
+                    fallback=True,
+                    status=longitudinal_reference["status"] + ":hero_state_unavailable",
+                )
             return base_control
 
         effective_speed_mps = speed_mps if speed_mps is not None else self._compute_speed_mps_from_actor(hero_actor)
@@ -714,6 +1031,11 @@ class MyAgent(AutonomousAgent):
                 fallback=True,
                 status="mpc_exception",
             )
+            if longitudinal_reference is not None:
+                self._set_longitudinal_controller_diagnostics(
+                    fallback=True,
+                    status=longitudinal_reference["status"] + ":mpc_exception",
+                )
             return base_control
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -731,6 +1053,12 @@ class MyAgent(AutonomousAgent):
             front_vehicle_state=front_vehicle_state,
             vehicle_transform=transform,
             speed_mps=effective_speed_mps,
+        )
+        base_control = self._apply_mpc_longitudinal_control(
+            base_control,
+            effective_speed_mps,
+            current_control,
+            longitudinal_reference,
         )
         return base_control
 
@@ -1261,6 +1589,22 @@ class MyAgent(AutonomousAgent):
 
         return self._sensor_soft_brake + brake_pressure * (self._sensor_stop_brake - self._sensor_soft_brake)
 
+    def _should_force_mpc_waiting_left_brake_override(self, front_vehicle_state, ego_speed_mps=None):
+        if self._controller_mode != "mpc" or self._overtake_state != "waiting_left":
+            return True
+
+        profile = self._build_front_safety_profile(front_vehicle_state, ego_speed_mps)
+        front_distance_m = profile["distance_m"]
+        if front_distance_m is None:
+            return True
+        if front_distance_m <= profile["min_hold_distance_m"]:
+            return True
+        if profile["ttc_s"] is not None and profile["ttc_s"] <= self._front_vehicle_ttc_emergency_s:
+            return True
+        if front_distance_m <= profile["dynamic_emergency_distance_m"]:
+            return True
+        return False
+
     def _apply_sensor_navigation(self, control, current_waypoint, front_vehicle_state, left_oncoming, speed_mps=None):
         self._set_safety_intervention(False, "", 0.0)
         launch_assist_applied = False
@@ -1272,14 +1616,35 @@ class MyAgent(AutonomousAgent):
                     front_vehicle_state,
                     ego_speed_mps=speed_mps,
                 )
+                if (
+                    self._controller_mode == "mpc"
+                    and self._overtake_state == "waiting_left"
+                    and not self._should_force_mpc_waiting_left_brake_override(
+                        front_vehicle_state,
+                        ego_speed_mps=speed_mps,
+                    )
+                ):
+                    brake_value = 0.0
                 if brake_value > 1e-3:
                     self._set_safety_intervention(True, "front_obstacle", brake_value)
                     return self._apply_brake_override(control, brake_value)
 
         if self._overtake_state == "changing_left" and current_waypoint is not None:
             if self._overtake_origin_lane_id is not None and current_waypoint.lane_id == self._overtake_origin_lane_id:
+                if self._should_apply_mpc_lane_change_launch_assist(
+                    control,
+                    current_waypoint,
+                    front_vehicle_state,
+                    ego_speed_mps=speed_mps,
+                ):
+                    control = self._apply_mpc_lane_change_launch_assist(
+                        control,
+                        front_vehicle_state,
+                        ego_speed_mps=speed_mps,
+                    )
+                    launch_assist_applied = True
                 if self._should_block_lane_change_for_front_obstacle(front_vehicle_state, ego_speed_mps=speed_mps):
-                    if self._should_apply_mpc_lane_change_launch_assist(
+                    if (not launch_assist_applied) and self._should_apply_mpc_lane_change_launch_assist(
                         control,
                         current_waypoint,
                         front_vehicle_state,
@@ -2502,6 +2867,12 @@ class MyAgent(AutonomousAgent):
                     "camera_height": self.camera_height,
                     "mpc_horizon_steps": self._mpc_horizon_steps if self._controller_mode == "mpc" else None,
                     "mpc_prediction_dt": self._mpc_prediction_dt if self._controller_mode == "mpc" else None,
+                    "mpc_longitudinal_horizon_steps": (
+                        self._mpc_longitudinal_horizon_steps if self._controller_mode == "mpc" else None
+                    ),
+                    "mpc_longitudinal_prediction_dt": (
+                        self._mpc_longitudinal_prediction_dt if self._controller_mode == "mpc" else None
+                    ),
                     "route_id": route_metadata.get("route_id"),
                     "route_index": route_metadata.get("route_index"),
                     "repetition_index": route_metadata.get("repetition_index"),
@@ -2566,6 +2937,12 @@ class MyAgent(AutonomousAgent):
             "controller_compute_time_ms": self._last_controller_diagnostics["compute_time_ms"],
             "controller_status": self._last_controller_diagnostics["status"],
             "controller_fallback": self._last_controller_diagnostics["fallback"],
+            "longitudinal_controller_compute_time_ms": (
+                self._last_longitudinal_controller_diagnostics["compute_time_ms"]
+            ),
+            "longitudinal_controller_status": self._last_longitudinal_controller_diagnostics["status"],
+            "longitudinal_controller_fallback": self._last_longitudinal_controller_diagnostics["fallback"],
+            "longitudinal_accel_cmd_mps2": self._last_mpc_longitudinal_accel_cmd,
             "maneuver_state": self._overtake_state,
             "waiting_left_reason": self._waiting_left_reason,
             "speed_mps": speed_mps,
@@ -2735,6 +3112,7 @@ class MyAgent(AutonomousAgent):
         self._agent = None
         self._hero_actor = None
         self._mpc_controller = None
+        self._mpc_longitudinal_controller = None
         self._route_assigned = False
 
     def _load_config(self, path_to_conf_file):
@@ -2825,6 +3203,8 @@ class MyAgent(AutonomousAgent):
                         self._mpc_waiting_left_close_stop_distance = max(float(value), 0.0)
                     elif key == "mpc_waiting_left_close_stop_brake":
                         self._mpc_waiting_left_close_stop_brake = min(max(float(value), 0.0), 1.0)
+                    elif key == "mpc_waiting_left_oncoming_extra_stop_buffer_m":
+                        self._mpc_waiting_left_oncoming_extra_stop_buffer_m = max(float(value), 0.0)
                     elif key == "mpc_lane_change_launch_grace_time":
                         self._mpc_lane_change_launch_grace_time = max(float(value), 0.0)
                     elif key == "mpc_lane_change_launch_min_front_distance":
@@ -2837,6 +3217,28 @@ class MyAgent(AutonomousAgent):
                         self._mpc_lane_change_launch_throttle = min(max(float(value), 0.0), 1.0)
                     elif key == "mpc_lane_change_resume_speed_mps":
                         self._mpc_lane_change_resume_speed_mps = max(float(value), 0.0)
+                    elif key == "mpc_longitudinal_horizon_steps":
+                        self._mpc_longitudinal_horizon_steps = max(int(value), 4)
+                    elif key == "mpc_longitudinal_prediction_dt":
+                        self._mpc_longitudinal_prediction_dt = max(float(value), 1e-3)
+                    elif key == "mpc_longitudinal_max_accel_mps2":
+                        self._mpc_longitudinal_max_accel_mps2 = max(float(value), 0.1)
+                    elif key == "mpc_longitudinal_max_decel_mps2":
+                        self._mpc_longitudinal_max_decel_mps2 = max(float(value), 0.1)
+                    elif key == "mpc_longitudinal_max_accel_delta_per_cycle":
+                        self._mpc_longitudinal_max_accel_delta_per_cycle = max(float(value), 0.05)
+                    elif key == "mpc_longitudinal_stop_buffer_m":
+                        self._mpc_longitudinal_stop_buffer_m = max(float(value), 0.0)
+                    elif key == "mpc_waiting_left_target_speed_mps":
+                        self._mpc_waiting_left_target_speed_mps = max(float(value), 0.0)
+                    elif key == "mpc_waiting_left_creep_speed_mps":
+                        self._mpc_waiting_left_creep_speed_mps = max(float(value), 0.0)
+                    elif key == "mpc_changing_left_target_speed_mps":
+                        self._mpc_changing_left_target_speed_mps = max(float(value), 0.0)
+                    elif key == "mpc_passing_target_speed_mps":
+                        self._mpc_passing_target_speed_mps = max(float(value), 0.0)
+                    elif key == "mpc_changing_right_target_speed_mps":
+                        self._mpc_changing_right_target_speed_mps = max(float(value), 0.0)
                     elif key == "front_vehicle_min_hold_distance":
                         self._front_vehicle_min_hold_distance = max(float(value), 0.5)
                     elif key == "front_vehicle_reaction_time_s":

@@ -348,3 +348,230 @@ class LateralMPCController(object):
     @staticmethod
     def _wrap_angle(angle_rad):
         return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@dataclass
+class LongitudinalMPCResult(object):
+    throttle: float
+    brake: float
+    acceleration_mps2: float
+    status: str
+    candidate_count: int
+    target_speed_mps: float
+
+
+class LongitudinalMPCController(object):
+    """
+    Finite-horizon shooting MPC for 1D longitudinal speed control.
+
+    The controller optimizes a short acceleration sequence around the desired
+    speed while penalizing predicted front-gap and TTC violations.
+    """
+
+    def __init__(
+        self,
+        horizon_steps=10,
+        prediction_dt=0.20,
+        max_accel_mps2=2.2,
+        max_decel_mps2=4.8,
+        max_accel_delta_per_cycle=0.85,
+        speed_weight=1.5,
+        terminal_speed_weight=2.5,
+        accel_weight=0.08,
+        jerk_weight=0.28,
+        safety_distance_weight=22.0,
+        safety_ttc_weight=7.0,
+        stop_buffer_m=0.45,
+    ):
+        self.horizon_steps = max(int(horizon_steps), 4)
+        self.prediction_dt = max(float(prediction_dt), 1e-3)
+        self.max_accel_mps2 = max(float(max_accel_mps2), 0.1)
+        self.max_decel_mps2 = max(float(max_decel_mps2), 0.1)
+        self.max_accel_delta_per_cycle = max(float(max_accel_delta_per_cycle), 0.05)
+        self.speed_weight = float(speed_weight)
+        self.terminal_speed_weight = float(terminal_speed_weight)
+        self.accel_weight = float(accel_weight)
+        self.jerk_weight = float(jerk_weight)
+        self.safety_distance_weight = float(safety_distance_weight)
+        self.safety_ttc_weight = float(safety_ttc_weight)
+        self.stop_buffer_m = max(float(stop_buffer_m), 0.0)
+
+    def compute_control(
+        self,
+        speed_mps,
+        target_speed_mps,
+        current_accel_cmd=0.0,
+        front_distance_m=None,
+        front_speed_mps=None,
+        dynamic_stop_distance_m=None,
+        dynamic_emergency_distance_m=None,
+        ttc_threshold_s=2.2,
+        fallback_throttle=0.0,
+        fallback_brake=0.0,
+    ):
+        speed_mps = max(float(speed_mps or 0.0), 0.0)
+        target_speed_mps = max(float(target_speed_mps or 0.0), 0.0)
+        current_accel_cmd = float(
+            np.clip(current_accel_cmd, -self.max_decel_mps2, self.max_accel_mps2)
+        )
+        fallback_accel_cmd = self._control_to_acceleration(fallback_throttle, fallback_brake)
+        target_accel_cmd = float(
+            np.clip(
+                (target_speed_mps - speed_mps) / self.prediction_dt,
+                -self.max_decel_mps2,
+                self.max_accel_mps2,
+            )
+        )
+
+        first_stage_candidates = self._generate_accel_candidates(
+            current_accel_cmd,
+            fallback_accel_cmd,
+            target_accel_cmd,
+        )
+        best_cost = float("inf")
+        best_accel_cmd = fallback_accel_cmd
+        candidate_count = 0
+        split_index = max(self.horizon_steps // 2, 1)
+
+        for first_stage in first_stage_candidates:
+            second_stage_candidates = self._generate_accel_candidates(
+                first_stage,
+                fallback_accel_cmd,
+                target_accel_cmd,
+            )
+            for second_stage in second_stage_candidates:
+                candidate_count += 1
+                cost = self._evaluate_sequence(
+                    speed_mps=speed_mps,
+                    target_speed_mps=target_speed_mps,
+                    current_accel_cmd=current_accel_cmd,
+                    first_stage=first_stage,
+                    second_stage=second_stage,
+                    split_index=split_index,
+                    front_distance_m=front_distance_m,
+                    front_speed_mps=front_speed_mps,
+                    dynamic_stop_distance_m=dynamic_stop_distance_m,
+                    dynamic_emergency_distance_m=dynamic_emergency_distance_m,
+                    ttc_threshold_s=ttc_threshold_s,
+                )
+                if cost < best_cost:
+                    best_cost = cost
+                    best_accel_cmd = first_stage
+
+        throttle, brake = self._acceleration_to_control(best_accel_cmd)
+        return LongitudinalMPCResult(
+            throttle=throttle,
+            brake=brake,
+            acceleration_mps2=best_accel_cmd,
+            status="mpc_longitudinal_ok" if candidate_count > 0 else "candidate_unavailable",
+            candidate_count=candidate_count,
+            target_speed_mps=target_speed_mps,
+        )
+
+    def _generate_accel_candidates(self, current_accel_cmd, fallback_accel_cmd, target_accel_cmd):
+        centers = [current_accel_cmd, fallback_accel_cmd, target_accel_cmd]
+        offsets = (
+            -self.max_accel_delta_per_cycle,
+            -0.5 * self.max_accel_delta_per_cycle,
+            0.0,
+            0.5 * self.max_accel_delta_per_cycle,
+            self.max_accel_delta_per_cycle,
+        )
+
+        candidates = set()
+        lower = current_accel_cmd - self.max_accel_delta_per_cycle
+        upper = current_accel_cmd + self.max_accel_delta_per_cycle
+        for center in centers:
+            for offset in offsets:
+                candidate = float(
+                    np.clip(
+                        center + offset,
+                        -self.max_decel_mps2,
+                        self.max_accel_mps2,
+                    )
+                )
+                candidate = float(np.clip(candidate, lower, upper))
+                candidates.add(round(candidate, 4))
+
+        if not candidates:
+            return [float(np.clip(fallback_accel_cmd, -self.max_decel_mps2, self.max_accel_mps2))]
+        return sorted(candidates)
+
+    def _evaluate_sequence(
+        self,
+        speed_mps,
+        target_speed_mps,
+        current_accel_cmd,
+        first_stage,
+        second_stage,
+        split_index,
+        front_distance_m=None,
+        front_speed_mps=None,
+        dynamic_stop_distance_m=None,
+        dynamic_emergency_distance_m=None,
+        ttc_threshold_s=2.2,
+    ):
+        predicted_speed_mps = max(float(speed_mps or 0.0), 0.0)
+        predicted_gap_m = None if front_distance_m is None else float(front_distance_m)
+        front_speed_value = 0.0 if front_speed_mps is None else max(float(front_speed_mps), 0.0)
+        stop_distance_m = None
+        if dynamic_stop_distance_m is not None:
+            stop_distance_m = max(float(dynamic_stop_distance_m) + self.stop_buffer_m, 0.0)
+        emergency_distance_m = None
+        if dynamic_emergency_distance_m is not None:
+            emergency_distance_m = max(float(dynamic_emergency_distance_m), 0.0)
+
+        total_cost = 0.0
+        first_stage = float(first_stage)
+        second_stage = float(second_stage)
+
+        for step in range(self.horizon_steps):
+            accel_cmd = first_stage if step < split_index else second_stage
+            next_speed_mps = max(predicted_speed_mps + accel_cmd * self.prediction_dt, 0.0)
+
+            speed_error_mps = next_speed_mps - target_speed_mps
+            total_cost += self.speed_weight * (speed_error_mps * speed_error_mps)
+            total_cost += self.accel_weight * (accel_cmd * accel_cmd)
+
+            if predicted_gap_m is not None:
+                ego_step_m = predicted_speed_mps * self.prediction_dt + 0.5 * accel_cmd * (self.prediction_dt ** 2)
+                ego_step_m = max(ego_step_m, 0.0)
+                front_step_m = front_speed_value * self.prediction_dt
+                predicted_gap_m = predicted_gap_m + front_step_m - ego_step_m
+
+                if emergency_distance_m is not None and predicted_gap_m <= emergency_distance_m:
+                    gap_error_m = emergency_distance_m - predicted_gap_m + 0.05
+                    total_cost += self.safety_distance_weight * 25.0 * (gap_error_m * gap_error_m)
+                elif stop_distance_m is not None and predicted_gap_m <= stop_distance_m:
+                    gap_error_m = stop_distance_m - predicted_gap_m
+                    total_cost += self.safety_distance_weight * (gap_error_m * gap_error_m)
+
+                closing_speed_mps = max(next_speed_mps - front_speed_value, 0.0)
+                if closing_speed_mps > 1e-3 and predicted_gap_m > 0.0:
+                    predicted_ttc_s = predicted_gap_m / closing_speed_mps
+                    if predicted_ttc_s < ttc_threshold_s:
+                        ttc_error_s = ttc_threshold_s - predicted_ttc_s
+                        total_cost += self.safety_ttc_weight * (ttc_error_s * ttc_error_s)
+
+            predicted_speed_mps = next_speed_mps
+
+        terminal_speed_error_mps = predicted_speed_mps - target_speed_mps
+        total_cost += self.terminal_speed_weight * (terminal_speed_error_mps * terminal_speed_error_mps)
+        total_cost += self.jerk_weight * (
+            ((first_stage - current_accel_cmd) ** 2) + ((second_stage - first_stage) ** 2)
+        )
+        return float(total_cost)
+
+    def _control_to_acceleration(self, throttle, brake):
+        throttle_value = float(np.clip(throttle, 0.0, 1.0))
+        brake_value = float(np.clip(brake, 0.0, 1.0))
+        return throttle_value * self.max_accel_mps2 - brake_value * self.max_decel_mps2
+
+    def _acceleration_to_control(self, acceleration_mps2):
+        accel_value = float(np.clip(acceleration_mps2, -self.max_decel_mps2, self.max_accel_mps2))
+        if accel_value >= 0.0:
+            throttle = float(np.clip(accel_value / self.max_accel_mps2, 0.0, 1.0))
+            return throttle, 0.0
+
+        brake = float(np.clip((-accel_value) / self.max_decel_mps2, 0.0, 1.0))
+        return 0.0, brake
