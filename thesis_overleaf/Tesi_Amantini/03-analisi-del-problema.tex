@@ -1,0 +1,145 @@
+\chapter{Analisi del problema}
+
+\section{Descrizione dello scenario}
+
+Lo scenario principale della tesi prevede un veicolo autonomo, indicato come veicolo ego, che percorre una strada a due corsie e incontra un ostacolo fermo lungo la corsia di marcia. L'ostacolo blocca il proseguimento della route nominale e costringe il sistema a scegliere tra una strategia conservativa, basata su rallentamento o arresto, e una strategia attiva, basata sul cambio corsia e sul superamento dell'ostacolo.
+
+Nel progetto la manovra è stata studiata in tre varianti progressive: scenario con solo ostacolo fermo, scenario con ostacolo e veicolo nella corsia adiacente nello stesso senso di marcia, scenario con ostacolo e veicolo nella corsia adiacente in senso opposto. In tutti i casi il problema da risolvere è il medesimo: capire se la corsia laterale possa essere utilizzata in sicurezza e, in caso affermativo, eseguire il sorpasso e il successivo rientro.
+
+Dal punto di vista funzionale, il veicolo deve decidere se:
+
+\begin{itemize}
+    \item rallentare o fermarsi;
+    \item cambiare corsia;
+    \item superare l'ostacolo;
+    \item rientrare nella corsia originale;
+    \item continuare la guida normale.
+\end{itemize}
+
+\section{Veicolo ego e ambiente circostante}
+
+Il veicolo ego è l'agente controllato dal sistema sviluppato nella tesi. Esso riceve come obiettivo una route definita da waypoint e deve percorrerla mantenendo un comportamento sicuro. L'ambiente circostante viene descritto attraverso un insieme limitato ma significativo di elementi:
+
+\begin{itemize}
+    \item il veicolo ego, di cui sono noti posizione, orientamento, velocità e stato di controllo;
+    \item l'ostacolo sulla corsia corrente, rilevato come oggetto bloccante davanti al veicolo;
+    \item un eventuale veicolo posteriore nella corsia di destinazione, rilevante per la sicurezza dell'inserimento;
+    \item un eventuale veicolo frontale nella corsia di destinazione o nella corsia opposta, rilevante per la sicurezza del sorpasso;
+    \item la corsia originale, che rappresenta il riferimento di marcia normale;
+    \item la corsia usata per il superamento, che coincide con la corsia laterale adiacente.
+\end{itemize}
+
+La scena non è quindi modellata come un ambiente stradale generale e arbitrario, ma come una configurazione strutturata attorno al problema del superamento di un ostacolo singolo.
+
+\section{Ipotesi operative}
+
+Per rendere il problema trattabile in modo chiaro e sperimentalmente ripetibile, il progetto adotta alcune ipotesi semplificative. Esse non annullano il valore del lavoro, ma definiscono il perimetro entro cui i risultati devono essere interpretati:
+
+\begin{itemize}
+    \item la posizione dell'ostacolo è rilevabile tramite i sensori disponibili e la rappresentazione locale della scena;
+    \item la posizione dei veicoli circostanti è disponibile attraverso radar, waypoint e rilevamento visivo laterale;
+    \item la velocità dei veicoli circostanti è disponibile o stimabile a partire dalle misure radar;
+    \item la strada è rappresentata tramite corsie note e waypoint forniti dalla mappa di CARLA;
+    \item il veicolo può eseguire il cambio corsia se sono rispettate determinate condizioni di sicurezza;
+    \item il comportamento degli altri veicoli è considerato quasi costante durante una breve finestra temporale di decisione.
+\end{itemize}
+
+Queste ipotesi riflettono una situazione tipica della simulazione: i dati sono meno rumorosi di quelli reali e il contesto è controllato. I risultati ottenuti vanno quindi letti come validazione del framework nel dominio simulato considerato.
+
+\section{Variabili considerate}
+
+La logica decisionale utilizza un insieme di variabili geometriche, cinematiche e temporali. Tra le principali si possono citare:
+
+\begin{itemize}
+    \item distanza dall'ostacolo;
+    \item velocità del veicolo ego;
+    \item distanza dal veicolo posteriore;
+    \item velocità del veicolo posteriore;
+    \item distanza dal veicolo frontale;
+    \item velocità del veicolo frontale;
+    \item distanza minima di sicurezza;
+    \item tempo minimo richiesto per il cambio corsia;
+    \item tempo alla collisione.
+\end{itemize}
+
+Nel progetto queste grandezze non vengono usate solo come soglie statiche. In particolare, la distanza rispetto all'ostacolo viene interpretata anche mediante un profilo dinamico di sicurezza, che dipende dalla velocità relativa, dal tempo di reazione e dalla decelerazione confortevole disponibile. In forma semplificata:
+
+\[
+d_{em} = d_{min} + t_r v_{rel} + \frac{v_{rel}^2}{2a_c}
+\]
+
+dove \(d_{em}\) rappresenta la distanza di emergenza, \(d_{min}\) una distanza minima di mantenimento, \(t_r\) il tempo di reazione, \(v_{rel}\) la velocità relativa di chiusura e \(a_c\) la decelerazione confortevole assunta dal sistema.
+
+\section{Condizioni di sicurezza}
+
+Prima di iniziare il sorpasso, il sistema verifica una serie di condizioni che devono essere soddisfatte simultaneamente. Le più importanti sono:
+
+\begin{itemize}
+    \item presenza effettiva di un ostacolo che blocca la corsia corrente;
+    \item distanza sufficiente per evitare che la manovra inizi già in condizioni di emergenza;
+    \item assenza di veicoli troppo vicini posteriormente nella corsia di destinazione;
+    \item assenza di veicoli frontali o laterali che rendano la corsia di sorpasso non praticabile;
+    \item disponibilità di una corsia adiacente di tipo \texttt{Driving};
+    \item possibilità di rientrare nella corsia originale dopo il superamento.
+\end{itemize}
+
+Tra le formule utilizzate nel progetto vi è il Time To Collision:
+
+\[
+TTC = \frac{d}{v_{rel}}
+\]
+
+utilizzato per qualificare il livello di rischio di avvicinamento. La logica combina poi il \(TTC\) con soglie dinamiche di distanza, così da evitare decisioni basate esclusivamente su un valore metrico fisso.
+
+\section{Casi sicuri e casi non sicuri}
+
+Un caso può essere considerato sicuro quando la corsia di sorpasso è disponibile e il tempo necessario a completare la manovra è compatibile con la dinamica osservata. Esempi tipici di casi sicuri sono:
+
+\begin{itemize}
+    \item nessun veicolo nella corsia di sorpasso;
+    \item veicolo posteriore sufficientemente lontano o in allontanamento;
+    \item veicolo frontale sufficientemente lontano;
+    \item spazio sufficiente per rientrare nella corsia originale.
+\end{itemize}
+
+Al contrario, un caso è non sicuro quando almeno una delle condizioni precedenti viene violata. Esempi significativi sono:
+
+\begin{itemize}
+    \item veicolo posteriore in rapido avvicinamento;
+    \item veicolo frontale troppo vicino;
+    \item distanza dall'ostacolo troppo bassa per completare la manovra senza entrare in emergenza;
+    \item corsia di rientro non libera.
+\end{itemize}
+
+Nel progetto questi casi non sicuri non producono semplicemente un rifiuto statico della manovra, ma danno luogo a stati intermedi di attesa e a meccanismi di override che consentono all'agente di riprendere la decisione non appena le condizioni tornano favorevoli.
+
+\section{Requisiti funzionali}
+
+Dal punto di vista funzionale, il sistema deve essere in grado di:
+
+\begin{itemize}
+    \item rilevare la presenza di un ostacolo davanti al veicolo;
+    \item valutare la necessità di una manovra evasiva;
+    \item controllare la sicurezza della corsia di destinazione;
+    \item decidere se iniziare il cambio corsia;
+    \item gestire il superamento dell'ostacolo;
+    \item controllare la sicurezza del rientro;
+    \item riportare il veicolo nella corsia originale.
+\end{itemize}
+
+A questi requisiti si aggiunge la necessità di registrare in modo sistematico il comportamento del veicolo e delle variabili di sicurezza, così da permettere un'analisi quantitativa dei risultati.
+
+\section{Requisiti non funzionali}
+
+Oltre agli aspetti funzionali, il sistema deve soddisfare alcuni requisiti non funzionali, che descrivono il modo in cui il comportamento deve essere prodotto:
+
+\begin{itemize}
+    \item evitare collisioni;
+    \item produrre traiettorie fluide;
+    \item limitare oscillazioni dello sterzo;
+    \item mantenere tempi di calcolo compatibili con l'esecuzione in tempo reale;
+    \item essere modulare e modificabile;
+    \item permettere il confronto tra diversi controllori.
+\end{itemize}
+
+Questi requisiti sono particolarmente importanti per l'obiettivo della tesi, perché il confronto tra PID e MPC ha senso solo se il framework decisionale, i sensori e gli scenari di prova restano il più possibile invariati.

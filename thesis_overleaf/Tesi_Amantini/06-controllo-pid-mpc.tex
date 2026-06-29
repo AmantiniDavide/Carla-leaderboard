@@ -1,0 +1,178 @@
+\chapter{Controllo PID e MPC}
+
+\section{Ruolo del controllo nella manovra}
+
+Nel sistema sviluppato, il framework decisionale stabilisce \emph{quando} la manovra deve essere eseguita e \emph{quale} piano locale debba essere seguito; il controllore ha invece il compito di trasformare tale riferimento in comandi effettivi di guida. Questa distinzione è fondamentale: la decisione può essere corretta dal punto di vista logico, ma se il controllo non è in grado di seguirla con precisione e stabilità, la manovra può comunque risultare inefficace o insicura.
+
+Il controllore riceve come riferimento la route attiva o il piano locale generato durante la manovra di sorpasso e produce i comandi necessari per guidare il veicolo. Nel caso specifico della tesi, i due approcci confrontati condividono la stessa logica decisionale e differiscono principalmente nella modalità con cui il piano viene seguito.
+
+\section{Controllo laterale e longitudinale}
+
+La manovra di sorpasso coinvolge contemporaneamente due sottoproblemi di controllo:
+
+\begin{itemize}
+    \item controllo laterale tramite sterzo;
+    \item controllo longitudinale tramite accelerazione e frenata;
+    \item inseguimento della traiettoria;
+    \item mantenimento della velocità desiderata;
+    \item riduzione dell'errore laterale rispetto alla corsia target.
+\end{itemize}
+
+Il controllo laterale governa l'uscita dalla corsia originale, la permanenza nella corsia di sorpasso e il rientro finale. Il controllo longitudinale, invece, regola l'avvicinamento all'ostacolo, la fase di attesa, la ripartenza e la velocità mantenuta durante il superamento. Nella soluzione PID questi due aspetti sono gestiti dal \textit{BasicAgent} di CARLA con una logica reattiva; nella soluzione MPC il canale laterale è affidato a un controllore predittivo e, durante la manovra, anche il canale longitudinale viene regolato con un MPC dedicato.
+
+\section{Controllore PID}
+
+La baseline PID utilizzata nel progetto prende come punto di partenza il controllore già integrato nel \textit{BasicAgent} di CARLA, ma il suo impiego all'interno della tesi non coincide con un semplice riuso del comportamento standard. Il controllore viene infatti inserito in un'architettura nuova, nella quale il piano locale cambia dinamicamente in funzione della macchina a stati, le soglie di sicurezza vengono ridefinite per il caso di sorpasso e il comportamento viene misurato in modo sistematico tramite logging e metriche dedicate. In pratica, il piano locale prodotto dal local planner viene seguito da una logica di tracking reattiva che trasforma l'errore rispetto ai waypoint di riferimento in comandi di sterzo e di velocità, ma il risultato sperimentale osservato nasce dall'integrazione complessiva realizzata nel progetto.
+
+Nel progetto il comportamento PID agisce in particolare su:
+
+\begin{itemize}
+    \item errore laterale rispetto alla traiettoria locale;
+    \item errore di orientamento rispetto alla direzione desiderata;
+    \item errore di velocità per il canale longitudinale.
+\end{itemize}
+
+La forma generale di un PID può essere espressa come:
+
+\[
+u(t) = K_p e(t) + K_i \int e(t)dt + K_d \frac{de(t)}{dt}
+\]
+
+dove \(u(t)\) è il comando di controllo, \(e(t)\) è l'errore e \(K_p\), \(K_i\), \(K_d\) sono i parametri del controllore. Nel progetto questa formulazione va interpretata come riferimento concettuale del comportamento PID adottato: il tracking di base fornito dal framework è stato inserito, parametrizzato e validato all'interno di una logica di sorpasso sviluppata nella tesi, diventando così parte di un sistema sperimentale più ampio e non un elemento usato isolatamente.
+
+\section{Taratura del PID}
+
+La taratura del PID è stata svolta manualmente, tramite prove sperimentali iterative. L'obiettivo non era ottenere il massimo delle prestazioni teoriche in assoluto, ma raggiungere un comportamento stabile, sufficientemente fluido e confrontabile con l'MPC nelle stesse condizioni di scenario.
+
+I parametri longitudinali finali e i principali limiti di attuazione usati nella configurazione baseline sono riportati in Tabella~\ref{tab:pid-params}.
+
+\begin{table}[H]
+    \centering
+    \caption{Parametri principali della configurazione PID}
+    \label{tab:pid-params}
+    \begin{tabular}{lc}
+        \toprule
+        \textbf{Parametro} & \textbf{Valore} \\
+        \midrule
+        \(K_P\) longitudinale & 0.78 \\
+        \(K_I\) longitudinale & 0.03 \\
+        \(K_D\) longitudinale & 0.08 \\
+        massimo throttle & 0.75 \\
+        massimo brake nominale & 0.24 \\
+        soglia brake di emergenza sensore & 0.95 \\
+        target speed nominale & 20 km/h \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Oltre a questi parametri, il comportamento complessivo del PID è influenzato anche dalle soglie dei moduli di sicurezza, come le distanze di arresto frontali, le soglie \(TTC\) e i margini di rientro. In questo senso, la baseline PID non va letta come un semplice controllore isolato già pronto all'uso, ma come un componente che acquista significato e utilità solo all'interno dell'architettura sviluppata nella tesi, cioè insieme alla macchina a stati, alla gestione del cambio corsia, agli override di sicurezza e alla pipeline di valutazione.
+
+\section{Model Predictive Control}
+
+Il controllore MPC implementato nella tesi è un controllore predittivo \emph{shooting-based} a orizzonte finito. A differenza del PID, che reagisce all'errore corrente, l'MPC usa un modello del veicolo per simulare l'evoluzione futura dello stato e selezionare il comando che minimizza una funzione costo. Nel progetto questa logica è applicata in modo esplicito al controllo laterale e, durante le fasi del sorpasso, anche al controllo longitudinale.
+
+Il modello laterale è basato su un \textit{kinematic bicycle model}, con le seguenti grandezze principali:
+
+\begin{itemize}
+    \item stato del veicolo \((x, y, \psi, v)\);
+    \item comando di sterzo normalizzato;
+    \item interasse del veicolo pari a 2.875 m;
+    \item orizzonte di predizione pari a 14 passi;
+    \item passo di predizione pari a 0.10 s.
+\end{itemize}
+
+Per il canale longitudinale viene invece usato un secondo MPC monodimensionale, basato su velocità e accelerazione, con orizzonte di 10 passi e passo di predizione di 0.20 s. Tale controllore regola la velocità soprattutto nelle fasi \texttt{waiting\_left}, \texttt{changing\_left}, \texttt{passing} e \texttt{changing\_right}.
+
+È importante osservare che l'MPC qui adottato non risolve un problema quadratico generale tramite solver esterni, ma esplora un insieme finito di candidati di controllo a due stadi, valutandone il costo mediante rollout del modello. Si tratta quindi di un MPC leggero, adatto all'integrazione diretta nell'agente senza introdurre dipendenze più pesanti.
+
+\section{Funzione costo dell'MPC}
+
+Per il controllo laterale la funzione costo penalizza la distanza dalla traiettoria di riferimento, l'errore di orientamento, l'ampiezza del comando di sterzo e la sua variazione tra due stadi successivi. In forma compatta, essa può essere descritta come:
+
+\[
+J_{\text{lat}} =
+\sum_{k=0}^{N-1}
+\left(
+q_p \|p_k - p_k^{ref}\|^2 +
+q_{\psi} e_{\psi,k}^2
+\right)
++
+q_{p,N}\|p_N - p_N^{ref}\|^2
++
+q_{\psi,N} e_{\psi,N}^2
++
+r_{\delta}\left(\delta_1^2 + \delta_2^2\right)
++
+r_{\Delta \delta}(\delta_1 - \delta_0)^2
++
+r_s(\delta_2 - \delta_1)^2
+\]
+
+dove \(p_k\) è la posizione prevista del veicolo, \(p_k^{ref}\) la posizione di riferimento, \(e_{\psi,k}\) l'errore di orientamento, \(\delta_0\) il comando di sterzo corrente e \(\delta_1\), \(\delta_2\) i due livelli di sterzo esplorati nel rollout.
+
+Nel codice questi termini sono pesati in modo da privilegiare:
+
+\begin{itemize}
+    \item l'accuratezza laterale e di heading;
+    \item la stabilità terminale della traiettoria;
+    \item la limitazione delle correzioni troppo brusche;
+    \item la fluidità tra il primo e il secondo tratto del comando.
+\end{itemize}
+
+Per il canale longitudinale il costo minimizza l'errore di velocità, l'ampiezza dell'accelerazione, la sua variazione temporale e le violazioni dei margini di sicurezza rispetto all'ostacolo frontale. Una forma rappresentativa è:
+
+\[
+J_{\text{lon}} =
+\sum_{k=0}^{N-1}
+\left(
+q_v (v_k - v_k^{ref})^2 +
+r_a a_k^2
+\right)
++
+r_j \left[(a_1-a_0)^2 + (a_2-a_1)^2\right]
++
+q_d \phi_d +
+q_{ttc}\phi_{ttc}
+\]
+
+dove \(v_k\) è la velocità prevista, \(v_k^{ref}\) la velocità target, \(a_k\) l'accelerazione e \(\phi_d\), \(\phi_{ttc}\) termini di penalizzazione legati alla distanza di sicurezza e al \(TTC\).
+
+\section{Vincoli dell'MPC}
+
+Il controllore MPC implementato nel progetto opera entro vincoli espliciti, alcuni intrinseci al modello e altri introdotti come limiti pratici di sicurezza e comfort. I principali sono:
+
+\begin{itemize}
+    \item limite massimo del comando di sterzo;
+    \item limite massimo della variazione dello sterzo per ciclo;
+    \item limite più restrittivo sullo sterzo durante il rientro;
+    \item limite di accelerazione pari a 2.2 m/s\(^2\);
+    \item limite di decelerazione pari a 4.8 m/s\(^2\);
+    \item limite sulla variazione dell'accelerazione per ciclo;
+    \item vincoli dinamici di arresto e di emergenza rispetto all'ostacolo frontale.
+\end{itemize}
+
+Oltre ai vincoli espliciti, il comando grezzo prodotto dall'MPC viene ulteriormente sagomato da una logica di \textit{commitment} e \textit{release}. In pratica, durante l'uscita dalla corsia originale il sistema mantiene per un certo tempo una sterzata sufficientemente decisa verso la corsia di sorpasso, in modo da evitare un rientro prematuro. Analogamente, nella fase di rientro il comando viene progressivamente limitato per favorire la stabilizzazione del veicolo nella corsia originaria.
+
+\section{Criteri di confronto tra PID e MPC}
+
+Per confrontare in modo omogeneo i due controllori sono state definite metriche comuni, calcolate a partire dai log frame-by-frame prodotti durante la simulazione. Le metriche principali utilizzate nel seguito sono:
+
+\begin{itemize}
+    \item errore laterale medio;
+    \item errore laterale massimo;
+    \item tempo necessario per completare la manovra;
+    \item oscillazione del comando di sterzo, stimata tramite la derivata media assoluta dello sterzo;
+    \item fluidità della traiettoria, valutata anche tramite accelerazione longitudinale e jerk;
+    \item distanza minima dagli ostacoli e dagli altri veicoli;
+    \item tempo computazionale medio per iterazione.
+\end{itemize}
+
+Nel dettaglio, l'errore laterale medio e massimo sono usati per misurare la precisione con cui il veicolo segue la corsia o la traiettoria desiderata. Il tempo di manovra misura invece l'efficienza complessiva del sorpasso, includendo le fasi di attesa, cambio corsia, superamento e rientro. La distanza minima dal veicolo ostacolo e dagli altri attori fornisce un'indicazione diretta del margine di sicurezza mantenuto durante la manovra.
+
+Per valutare la regolarità del controllo sono stati considerati il tasso di variazione dello sterzo e il numero di saturazioni del comando, poiché correzioni troppo frequenti o troppo brusche indicano una traiettoria meno fluida. Infine, il tempo computazionale medio per iterazione consente di confrontare la complessità pratica dei due approcci: il PID ha una struttura più semplice, mentre l'MPC richiede la valutazione di più candidati di controllo ad ogni passo.
+
+\section{Aspettative sul confronto}
+
+Prima dei risultati sperimentali, è ragionevole aspettarsi differenze nette tra i due approcci. Il PID, essendo un controllore reattivo e relativamente semplice, dovrebbe essere più leggero dal punto di vista computazionale e in molti casi anche rapido nel completare la manovra. Tuttavia, questa semplicità può tradursi in comandi meno regolari, con correzioni di sterzo più frequenti e frenate più brusche nelle situazioni critiche.
+
+L'MPC, al contrario, dovrebbe offrire una traiettoria più fluida e un controllo laterale più regolare, poiché tiene conto di un orizzonte temporale futuro e dei vincoli del problema. Ci si aspetta quindi un vantaggio soprattutto nella fluidità del cambio corsia e nel rispetto dei margini di sicurezza, a fronte di un costo computazionale superiore. Il confronto sperimentale del capitolo successivo serve proprio a verificare se questi vantaggi teorici dell'MPC si manifestano anche nello scenario di sorpasso implementato.

@@ -1,0 +1,115 @@
+\chapter{Implementazione}
+
+\section{Ambiente di sviluppo}
+
+L'implementazione è stata sviluppata in Python, utilizzando il framework CARLA Leaderboard come ambiente di simulazione e valutazione \cite{dosovitskiy2017carla}. Lo sviluppo è stato eseguito in ambiente Linux, con un agente compatibile con il tracciato \texttt{SENSORS} del Leaderboard.
+
+Le principali librerie e componenti utilizzate sono:
+
+\begin{itemize}
+    \item Python come linguaggio di programmazione;
+    \item CARLA e il relativo \textit{BasicAgent} per la navigazione di base;
+    \item NumPy per il calcolo numerico;
+    \item Pygame per la visualizzazione di debug;
+    \item Ultralytics YOLO per il rilevamento laterale dei veicoli;
+    \item moduli custom per logging, metriche e generazione degli artefatti della tesi.
+\end{itemize}
+
+L'ambiente sperimentale è stato completato da script di configurazione e automazione, utili per eseguire in modo ripetibile le campagne PID e MPC e per esportare automaticamente tabelle e grafici verso il progetto Overleaf. Anche questo aspetto fa parte del contributo del lavoro: senza tale infrastruttura, i moduli presenti nel progetto non avrebbero costituito un sistema sperimentale realmente utilizzabile per l'analisi comparativa.
+
+\section{Struttura del codice}
+
+Il codice del progetto è organizzato in moduli con responsabilità distinte. I file principali sono:
+
+\begin{itemize}
+    \item \texttt{leaderboard/autoagents/agent.py}: agente principale, sensori, logica decisionale, integrazione con i controller, logging;
+    \item \texttt{leaderboard/autoagents/mpc\_controller.py}: implementazione dei controllori MPC laterale e longitudinale;
+    \item \texttt{leaderboard/metrics/metrics\_logger.py}: salvataggio frame-by-frame dei dati di guida;
+    \item \texttt{leaderboard/metrics/compute\_metrics.py}: aggregazione offline delle metriche per singola run;
+    \item \texttt{leaderboard/metrics/export\_thesis\_artifacts.py}: generazione di tabelle, grafici e testo LaTeX per la tesi;
+    \item \texttt{data/controller\_basic\_agent.conf}: configurazione della baseline PID;
+    \item \texttt{data/controller\_mpc.conf}: configurazione del controllore MPC;
+    \item \texttt{data/my\_routes.xml}: definizione delle route e dei tre scenari;
+    \item \texttt{run\_leaderboard.sh}: script di esecuzione delle campagne sperimentali.
+\end{itemize}
+
+Questa struttura rende possibile intervenire separatamente su decisione, controllo, configurazione e analisi dei risultati.
+
+\section{Rappresentazione dello scenario}
+
+Lo scenario è rappresentato tramite una combinazione di coordinate cartesiane globali, waypoint della mappa e identificativi di corsia forniti da CARLA. Le route sperimentali sono definite in \texttt{data/my\_routes.xml} e specificano:
+
+\begin{itemize}
+    \item la città utilizzata, pari a \texttt{Town12};
+    \item il waypoint iniziale e finale della route;
+    \item l'ostacolo parcheggiato sulla corsia di marcia;
+    \item i veicoli aggiuntivi, se previsti dallo scenario.
+\end{itemize}
+
+Il veicolo ego viene sempre riferito alla geometria della corsia corrente tramite i waypoint della mappa. Questa scelta consente di valutare in modo semplice errori laterali, errori di heading, progressione lungo la corsia target e completamento del rientro.
+
+\section{Implementazione del framework decisionale}
+
+La macchina a stati è implementata direttamente nel file \texttt{agent.py}. A ogni iterazione il sistema:
+
+\begin{itemize}
+    \item legge i sensori;
+    \item stima lo stato del veicolo frontale e dei veicoli rilevanti;
+    \item aggiorna la variabile \texttt{\_overtake\_state};
+    \item verifica le condizioni di transizione;
+    \item decide se mantenere il piano corrente o costruirne uno nuovo;
+    \item applica eventuali override di sicurezza.
+\end{itemize}
+
+Gli stati implementati sono quelli discussi nel Capitolo 5: \texttt{follow\_lane}, \texttt{waiting\_left}, \texttt{changing\_left}, \texttt{passing} e \texttt{changing\_right}. Le situazioni non sicure vengono gestite in due modi: impedendo la transizione allo stato successivo oppure modificando direttamente il comando finale tramite frenate di sicurezza.
+
+\section{Implementazione del cambio corsia}
+
+Il cambio corsia viene realizzato costruendo un piano locale temporaneo a partire dal piano residuo della route. Per l'uscita verso la corsia di sorpasso il piano comprende:
+
+\begin{itemize}
+    \item un tratto iniziale ancora sulla corsia di origine;
+    \item un tratto di cambio corsia;
+    \item un tratto di percorrenza nella corsia laterale.
+\end{itemize}
+
+La durata spaziale di questi segmenti è configurabile. Nella configurazione finale, il PID utilizza un tratto iniziale più lungo sulla corsia originaria, mentre l'MPC riduce tale tratto e affida di più al controllo predittivo la gestione dell'ingresso nella corsia di sorpasso. Per il rientro viene costruito un secondo piano, eventualmente ottenuto da un \textit{helper rejoin plan}, che riporta il veicolo verso la corsia originale.
+
+Il sistema considera completato il cambio corsia iniziale quando il \texttt{lane\_id} corrente non coincide più con quello della corsia di origine. Il rientro è invece considerato completato solo quando il veicolo risulta nuovamente stabilizzato nella corsia originale per un intervallo temporale minimo.
+
+\section{Implementazione del controllore PID}
+
+Dal punto di vista pratico, la modalità PID usa il \textit{BasicAgent} di CARLA come nucleo del controllore principale, ma il comportamento finale non deriva da un semplice utilizzo diretto del modulo standard. L'agente genera il comando tramite \texttt{run\_step()}, mentre il lavoro di tesi costruisce intorno a questo nucleo l'intera logica necessaria a renderlo adatto al problema del sorpasso:
+
+\begin{itemize}
+    \item selezione del piano locale da seguire;
+    \item parametri longitudinali \(K_P\), \(K_I\), \(K_D\);
+    \item limiti su throttle e brake;
+    \item logica di override per ostacolo frontale, \(TTC\) basso e situazioni di emergenza.
+\end{itemize}
+
+I parametri usati nella configurazione finale sono quelli riportati nel Capitolo 6. In aggiunta, il tempo di calcolo del controllore è stato misurato a runtime, così da poter essere confrontato con il costo computazionale dell'MPC. Nelle run selezionate per la tesi il tempo medio del PID è risultato pari a circa 2.48 ms per iterazione. Questo mostra che anche la soluzione PID presentata nei risultati non è il mero comportamento standard del simulatore, ma una configurazione sperimentale resa osservabile, confrontabile e riproducibile attraverso il lavoro di implementazione svolto.
+
+\section{Implementazione del controllore MPC}
+
+Il controllore MPC è stato implementato in \texttt{mpc\_controller.py} mediante due classi separate:
+
+\begin{itemize}
+    \item \texttt{LateralMPCController}, che ottimizza il comando di sterzo su un orizzonte finito;
+    \item \texttt{LongitudinalMPCController}, che ottimizza accelerazione, throttle e brake durante le fasi della manovra.
+\end{itemize}
+
+Il modello laterale è un bicycle model cinematico, mentre il modello longitudinale è monodimensionale e predice l'evoluzione della velocità e del gap frontale. Il metodo di ottimizzazione non usa un solver esterno generale, ma una ricerca shooting-based su sequenze candidate a due stadi. Questa scelta rende il controllore sufficientemente leggero da essere eseguito direttamente nell'agente a ogni iterazione.
+
+I principali parametri implementativi sono:
+
+\begin{itemize}
+    \item modello cinematico con interasse 2.875 m;
+    \item orizzonte laterale di 14 passi con \(dt = 0.10\) s;
+    \item orizzonte longitudinale di 10 passi con \(dt = 0.20\) s;
+    \item limiti espliciti su sterzo, variazione dello sterzo, accelerazione e decelerazione;
+    \item funzione costo con termini di tracking, regolarità e sicurezza;
+    \item fallback al controllo di base quando piano o stato del veicolo non sono disponibili.
+\end{itemize}
+
+L'implementazione comprende inoltre una fase di sagomatura del comando MPC, che introduce limiti specifici per l'uscita dalla corsia originale, il mantenimento della permanenza nella corsia di sorpasso e il rientro progressivo. Nelle run selezionate per la tesi, il tempo computazionale medio del controllore MPC è risultato pari a circa 28.67 ms per iterazione, valore coerente con la maggiore complessità dell'approccio rispetto al PID.

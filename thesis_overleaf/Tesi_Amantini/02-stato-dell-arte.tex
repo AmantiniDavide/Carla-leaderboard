@@ -1,0 +1,126 @@
+\chapter{Stato dell'arte}
+
+\section{Guida autonoma}
+
+La guida autonoma può essere interpretata come la cooperazione tra più sottosistemi specializzati. Una schematizzazione comunemente adottata comprende: percezione della scena, localizzazione del veicolo, predizione del comportamento degli altri utenti stradali, pianificazione della manovra e controllo dei comandi di attuazione \cite{paden2016survey}. Ciascun modulo ha un ruolo specifico, ma il comportamento finale del veicolo dipende dalla qualità dell'integrazione tra questi livelli.
+
+Nel contesto di questa tesi il contributo principale non consiste nello sviluppare da zero un'intera pila di percezione realistica, ma nel costruire un sistema completo di decisione, esecuzione e valutazione della manovra di sorpasso a partire dalle informazioni rese disponibili dal simulatore e dai sensori integrati nell'agente. In altri termini, il lavoro non si limita a presupporre dati già pronti: definisce quali informazioni siano realmente necessarie, integra radar, waypoint e rilevamento visivo in una rappresentazione operativa dello scenario e utilizza tale rappresentazione per rendere possibile una logica di sorpasso che, senza questa integrazione, non produrrebbe alcun risultato utile.
+
+\section{Percezione e rilevamento degli ostacoli}
+
+In un sistema di guida autonoma la percezione ha il compito di trasformare i dati dei sensori in una rappresentazione utilizzabile del mondo esterno. In generale questo processo include il rilevamento di ostacoli, corsie, veicoli, pedoni e segnaletica. Tecniche basate su telecamere, LiDAR, radar e sensor fusion vengono spesso combinate per ottenere una stima più robusta della scena.
+
+Nel progetto sviluppato per questa tesi la percezione è semplificata e orientata al problema specifico del sorpasso. Le informazioni principali impiegate dal framework decisionale sono:
+
+\begin{itemize}
+    \item la posizione relativa dell'ostacolo davanti al veicolo ego;
+    \item la distanza dall'ostacolo e il margine disponibile per frenare;
+    \item la presenza di veicoli che occupano o impegnano la corsia laterale;
+    \item la presenza di veicoli che sopraggiungono da dietro;
+    \item la geometria della corsia corrente e della corsia usata per il sorpasso.
+\end{itemize}
+
+In pratica, il sistema utilizza una combinazione di radar anteriore, radar posteriore, waypoint della mappa e rilevamento visivo laterale per costruire una stima locale dello scenario. Questa stima non è un semplice dato fornito in ingresso in forma già pronta, ma il risultato dell'integrazione svolta nel progetto tra sensori eterogenei, filtri geometrici, regole di interpretazione della corsia e variabili di sicurezza necessarie alla decisione.
+
+\section{Obstacle avoidance nella guida autonoma}
+
+Il problema dell'\textit{obstacle avoidance} nella guida autonoma può assumere forme diverse a seconda del tipo di ostacolo e del contesto stradale. Un ostacolo statico, come un veicolo fermo o parcheggiato, richiede spesso una scelta tra arresto e deviazione laterale. Un ostacolo dinamico, al contrario, impone anche la stima del comportamento futuro dell'altro agente e rende più difficile la previsione delle distanze di sicurezza.
+
+Le strategie più comuni per evitare un ostacolo sono la frenata, la deviazione locale della traiettoria e il cambio corsia. Nel caso affrontato in questa tesi l'ostacolo si trova sulla corsia di marcia e la soluzione più naturale non è una piccola correzione locale, ma una vera manovra di uscita dalla corsia, superamento e rientro. Di conseguenza il problema ricade nell'intersezione tra \textit{obstacle avoidance}, \textit{lane change decision} e \textit{trajectory tracking}.
+
+\section{Cambio corsia e sorpasso}
+
+Il cambio corsia è una manovra che richiede sia una decisione di alto livello sia un controllo accurato del veicolo. A livello decisionale bisogna determinare se la corsia di destinazione sia percorribile e se il tempo disponibile sia sufficiente per eseguire la manovra in sicurezza. A livello di controllo, invece, il veicolo deve seguire una traiettoria che porti fuori dalla corsia originale, mantenga un margine adeguato rispetto all'ostacolo e permetta un rientro stabile.
+
+Gli aspetti principali da valutare durante un sorpasso sono:
+
+\begin{itemize}
+    \item disponibilità della corsia di destinazione;
+    \item distanza dai veicoli posteriori;
+    \item distanza dai veicoli frontali;
+    \item velocità relative;
+    \item tempo necessario per completare la manovra;
+    \item possibilità di rientro nella corsia originale.
+\end{itemize}
+
+In letteratura, queste manovre sono spesso affrontate mediante logiche ibride: un livello discreto decide se e quando cambiare corsia, mentre un livello continuo genera e segue la traiettoria risultante \cite{paden2016survey}. Questa stessa separazione è adottata anche nel presente lavoro.
+
+\section{Metriche di sicurezza}
+
+La valutazione della sicurezza di una manovra non può basarsi su una sola grandezza. Per questo motivo, nella pratica vengono utilizzate metriche complementari che descrivono il rischio da punti di vista diversi. Le più rilevanti per il caso in esame sono:
+
+\begin{itemize}
+    \item distanza minima di sicurezza;
+    \item tempo alla collisione, o Time To Collision;
+    \item tempo di headway;
+    \item velocità relativa;
+    \item distanza laterale;
+    \item distanza longitudinale;
+    \item numero di collisioni o quasi-collisioni.
+\end{itemize}
+
+Una metrica particolarmente utile è il Time To Collision, che nel caso di velocità relativa costante può essere approssimato come:
+
+\[
+TTC = \frac{d}{v_{rel}}
+\]
+
+dove \(d\) è la distanza tra due veicoli e \(v_{rel}\) è la velocità relativa di avvicinamento. Un'altra grandezza importante è la distanza di arresto dinamica, che può essere espressa come somma di una distanza minima, di una distanza di reazione e di una distanza di frenata:
+
+\[
+d_{stop} = d_{min} + t_r v_{rel} + \frac{v_{rel}^2}{2a}
+\]
+
+Nel progetto tale principio viene usato in forma parametrica per costruire soglie dinamiche di arresto e di emergenza in funzione della velocità relativa e della decelerazione confortevole disponibile.
+
+\section{Controllo laterale e longitudinale del veicolo}
+
+Il controllo del veicolo può essere diviso in due componenti principali. Il controllo longitudinale riguarda velocità, accelerazione e frenata; il suo obiettivo è mantenere una velocità di riferimento o arrestare il veicolo quando la situazione lo richiede. Il controllo laterale riguarda invece lo sterzo, il mantenimento della corsia e l'inseguimento della traiettoria.
+
+Nel caso del sorpasso entrambe le componenti sono essenziali. Il controllo laterale deve gestire l'uscita dalla corsia, il mantenimento nella corsia di sorpasso e il rientro. Il controllo longitudinale deve invece modulare la velocità nelle fasi di attesa, di avvicinamento all'ostacolo e di ripresa del moto dopo il superamento.
+
+\section{Controllori PID}
+
+Il controllore PID è una delle tecniche più diffuse nei sistemi di automazione industriale e nei problemi di controllo classici \cite{astrom1995pid}. La sua popolarità deriva dalla semplicità concettuale e implementativa: il comando viene ottenuto combinando una componente proporzionale all'errore, una componente integrale che accumula l'errore nel tempo e una componente derivativa che reagisce alla sua variazione.
+
+Tra i principali vantaggi del PID si possono evidenziare:
+
+\begin{itemize}
+    \item semplicità implementativa;
+    \item basso costo computazionale;
+    \item facilità di comprensione;
+    \item buona efficacia in scenari semplici.
+\end{itemize}
+
+Accanto a questi aspetti positivi, il PID presenta anche limiti noti:
+
+\begin{itemize}
+    \item necessità di taratura dei parametri;
+    \item difficoltà nella gestione esplicita dei vincoli;
+    \item possibile instabilità o aggressività in scenari dinamici o fortemente non lineari.
+\end{itemize}
+
+Per questi motivi il PID rimane una baseline molto utile e spesso sorprendentemente efficace, ma non sempre ottimale quando il problema richiede di gestire vincoli multipli e obiettivi concorrenti.
+
+\section{Model Predictive Control}
+
+Il Model Predictive Control, o MPC, è una famiglia di tecniche di controllo che usa un modello del sistema per prevedere il comportamento futuro del veicolo e selezionare il comando che minimizza una funzione costo su un orizzonte finito \cite{camacho2007mpc}. A differenza del PID, l'MPC non reagisce solo all'errore istantaneo, ma valuta anche l'evoluzione prevista dello stato.
+
+I principali vantaggi dell'MPC sono:
+
+\begin{itemize}
+    \item capacità di considerare vincoli fisici e dinamici;
+    \item comportamento predittivo;
+    \item buona qualità nell'inseguimento della traiettoria;
+    \item maggiore controllo su comfort e fluidità della manovra.
+\end{itemize}
+
+Anche l'MPC, tuttavia, presenta alcuni svantaggi:
+
+\begin{itemize}
+    \item maggiore complessità implementativa;
+    \item maggiore costo computazionale;
+    \item dipendenza dalla qualità del modello matematico usato.
+\end{itemize}
+
+Nel contesto di questa tesi l'MPC è particolarmente interessante perché consente di esplicitare, almeno in parte, il compromesso tra precisione di tracking, regolarità del comando e rispetto dei vincoli di sicurezza durante il sorpasso.

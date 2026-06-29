@@ -1,0 +1,18 @@
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            width=0.88\textwidth,
+            xlabel={$t$ [s]},
+            ylabel={Sterzo [-]},
+            legend pos=north east,
+            grid=major,
+        ]
+            \addplot[blue, thick] table[x=t_rel_s,y=steer,col sep=comma]{{thesis_export_test/data/basic_agent__RouteScenario_1_rep0_control.csv}};
+            \addlegendentry{PID}
+            \addplot[red, thick] table[x=t_rel_s,y=steer,col sep=comma]{{thesis_export_test/data/mpc__RouteScenario_1_rep0_control.csv}};
+            \addlegendentry{MPC}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Comando di sterzo nello scenario 1 per PID e MPC.}
+\end{figure}

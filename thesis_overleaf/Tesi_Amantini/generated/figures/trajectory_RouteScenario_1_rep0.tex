@@ -1,0 +1,19 @@
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            width=0.88\textwidth,
+            axis equal image,
+            xlabel={$x$ [m]},
+            ylabel={$y$ [m]},
+            legend pos=south east,
+            grid=major,
+        ]
+            \addplot[blue, thick] table[x=x,y=y,col sep=comma]{generated/data/basic_agent__RouteScenario_1_rep0_trajectory.csv};
+            \addlegendentry{PID}
+            \addplot[red, thick] table[x=x,y=y,col sep=comma]{generated/data/mpc__RouteScenario_1_rep0_trajectory.csv};
+            \addlegendentry{MPC}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Traiettorie del veicolo ego nello scenario 1 per PID e MPC.}
+\end{figure}

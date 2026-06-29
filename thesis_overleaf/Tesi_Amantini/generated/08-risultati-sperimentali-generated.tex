@@ -1,0 +1,61 @@
+\chapter{Risultati sperimentali}
+
+\section{Obiettivo della valutazione}
+
+La valutazione sperimentale ha l'obiettivo di verificare se il framework decisionale autorizza il sorpasso solo quando la situazione è sufficientemente sicura e di confrontare il comportamento dei due controllori nelle stesse condizioni di test. In particolare, gli esperimenti analizzano la qualità dell'inseguimento di corsia, la fluidità della manovra, la distanza minima mantenuta rispetto agli ostacoli e il costo computazionale necessario per produrre i comandi di guida.
+
+\section{Scenari di test}
+
+Gli esperimenti sono stati condotti sulle tre route definite in \texttt{data/my\_routes.xml}, tutte ambientate in \texttt{Town12} e caratterizzate dallo stesso tratto stradale di base ma con livelli crescenti di complessità:
+
+\begin{itemize}
+\item \textbf{Scenario 0}: ostacolo parcheggiato sulla corsia, senza altri veicoli interferenti.
+\item \textbf{Scenario 1}: ostacolo parcheggiato con veicolo nella corsia adiacente in stesso senso di marcia.
+\item \textbf{Scenario 2}: ostacolo parcheggiato con veicolo in arrivo nella corsia adiacente in senso opposto.
+\end{itemize}
+
+\input{generated/tables/scenarios_table.tex}
+
+\section{Metriche di valutazione}
+
+Le metriche utilizzate per il confronto sono state estratte automaticamente dai log frame-by-frame prodotti dal simulatore. Per ciascuna run sono state considerate: errore laterale medio e massimo, tempo totale della manovra, distanza minima dal veicolo ostacolo durante il cambio corsia verso sinistra, oscillazione del comando di sterzo misurata tramite il valore medio assoluto della derivata dello sterzo e tempo computazionale medio del controllore. Sono inoltre stati monitorati il numero di frenate di emergenza, gli override di sicurezza e la presenza di manovre classificate come non sicure dal framework di analisi offline.
+
+\section{Risultati del framework decisionale}
+
+Nelle run rappresentative selezionate il framework ha completato la manovra con entrambi i controllori in tutti e tre gli scenari, riportando sempre lo stato finale a \texttt{follow\_lane}. Il comportamento decisionale è coerente con la complessità crescente delle route: nello scenario 0 l'ostacolo viene superato quasi immediatamente, nello scenario 1 compare una fase di attesa per liberare la corsia di sorpasso e nello scenario 2 l'attesa è influenzata dal veicolo in senso opposto. Nello scenario 1, che introduce un veicolo nella corsia adiacente nello stesso senso di marcia, il framework ha mantenuto una fase di attesa prima del cambio corsia sia per PID sia per MPC. Nella run rappresentativa PID l'attesa è stata di 1.45 s, mentre per l'MPC è stata di 1.50 s. 
+
+\input{generated/tables/decision_table.tex}
+
+\section{Risultati con controllo PID}
+
+Sulle tre run rappresentative, il controllore PID mostra un errore laterale medio pari a $0.163 \pm 0.018$\,m e un errore laterale massimo pari a $1.742 \pm 0.014$\,m. Il tempo medio di completamento della manovra è $12.50 \pm 3.48$\,s e la distanza minima dal veicolo ostacolo durante il cambio corsia verso sinistra è $6.54 \pm 1.35$\,m. L'oscillazione media dello sterzo, misurata tramite il valore medio assoluto della derivata del comando, risulta pari a $0.221 \pm 0.016$\,rad/s. Questi dati indicano un comportamento rapido e preciso, ma con correzioni di sterzo più frequenti rispetto all'MPC.
+
+Nei log PID compaiono inoltre alcuni interventi di frenata di emergenza nelle route più complesse, in particolare nello scenario 1 e nello scenario 2, segno che la manovra viene completata in modo efficace ma con un comportamento longitudinale più brusco e meno regolare.
+
+\input{generated/figures/trajectory_RouteScenario_1_rep0.tex}
+\input{generated/figures/lateral_error_RouteScenario_1_rep0.tex}
+\input{generated/figures/steer_RouteScenario_1_rep0.tex}
+
+\section{Risultati con controllo MPC}
+
+L'MPC, nelle run rappresentative selezionate, mostra un errore laterale medio pari a $0.272 \pm 0.029$\,m e un errore laterale massimo pari a $1.744 \pm 0.010$\,m. Il tempo medio di completamento della manovra è $15.13 \pm 4.11$\,s e la distanza minima dal veicolo ostacolo è $5.10 \pm 1.17$\,m. L'oscillazione media dello sterzo si riduce a $0.160 \pm 0.020$\,rad/s, suggerendo una traiettoria più regolare e un cambio corsia più fluido rispetto al PID.
+
+Il rovescio della medaglia è un comportamento mediamente più conservativo: nelle route con traffico aggiuntivo il tempo di manovra cresce, in particolare nello scenario 2, dove la strategia selezionata privilegia il completamento senza eventi critici anche a costo di restare più a lungo nella fase di attesa. Il costo computazionale medio delle run MPC selezionate è $28.67 \pm 2.60$\,ms.
+
+\section{Confronto tra PID e MPC}
+
+\input{generated/tables/overall_comparison_table.tex}
+
+\input{generated/tables/scenario_comparison_table.tex}
+
+Nel dataset selezionato, il PID risulta mediamente più accurato in termini di errore laterale e più rapido nel completamento della manovra, mentre l'MPC produce un comando di sterzo più regolare e quindi una traiettoria più fluida. La distanza minima dal veicolo ostacolo resta comparabile tra i due approcci, con un leggero vantaggio del PID nelle run scelte come rappresentative.
+
+\section{Discussione dei risultati}
+
+I risultati mostrano che il framework decisionale è in grado di differenziare correttamente tra condizioni immediatamente sicure e condizioni che richiedono una fase di attesa. Il sistema funziona meglio nello scenario 0, dove l'assenza di traffico addizionale rende la decisione quasi istantanea. Negli scenari 1 e 2 emergono invece i limiti della manovra: il PID tende a reagire in modo più aggressivo nelle fasi di frenata e ripartenza, mentre l'MPC privilegia la fluidità laterale ma può introdurre attese più lunghe e un costo computazionale sensibilmente superiore.
+
+Nel set di run attualmente selezionato il PID risulta sufficiente per completare la manovra e, anzi, mostra errori laterali medi inferiori. L'MPC mantiene però un vantaggio qualitativo sulla regolarità del comando di sterzo, aspetto che può diventare più rilevante in scenari più complessi o con vincoli dinamici più severi. Il tempo computazionale medio del PID sulle run selezionate è pari a $2.48 \pm 0.11$\,ms. In questa fase, quindi, il maggiore costo computazionale dell'MPC è giustificato soprattutto se l'obiettivo primario è la fluidità del controllo e il rispetto di vincoli futuri, mentre non emerge ancora un vantaggio netto in precisione pura.
+
+\section{Limiti sperimentali}
+
+Gli esperimenti presentano alcuni limiti che devono essere esplicitati. In primo luogo, gli scenari sono simulati e quindi non rappresentano tutte le incertezze del mondo reale. Inoltre, il numero di configurazioni testate è volutamente limitato a tre route principali, la percezione è semplificata e i sensori non includono rumore realistico. Un ulteriore limite riguarda il numero contenuto di run per ciascun scenario e per ciascun controllore: sebbene la campagna finale copra tutti e tre i subset per PID e MPC, un numero maggiore di ripetizioni permetterebbe una stima statistica piu robusta della variabilita dei risultati.

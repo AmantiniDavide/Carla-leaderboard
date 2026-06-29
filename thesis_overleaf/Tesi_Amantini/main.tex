@@ -1,0 +1,186 @@
+
+\documentclass[a4paper,final,12pt,oneside]{report}
+
+% -------------------------------------------------
+% Lingua, codifica e font
+% -------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[italian]{babel}
+\usepackage{times}
+
+% -------------------------------------------------
+% Impaginazione
+% -------------------------------------------------
+\usepackage[a4paper]{geometry}
+
+% Regole di impaginazione in stile Unibo
+\renewcommand{\baselinestretch}{1.25}
+\newlength{\alphabet}
+\settowidth{\alphabet}{\normalfont abcdefghijklmnopqrstuvwxyz}
+\geometry{textwidth=2.5\alphabet,lines=35,heightrounded}
+
+% -------------------------------------------------
+% Pacchetti grafici, tabelle e matematica
+% -------------------------------------------------
+\usepackage{graphicx}
+\usepackage[table,xcdraw]{xcolor}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{cite}
+
+% -------------------------------------------------
+% Codice e algoritmi
+% -------------------------------------------------
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% -------------------------------------------------
+% Link e riferimenti
+% -------------------------------------------------
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+% Profondità dell'indice
+\setcounter{tocdepth}{3}
+\setcounter{secnumdepth}{3}
+
+% -------------------------------------------------
+% Ambiente per eventuale dedica
+% -------------------------------------------------
+\newenvironment{dedication}
+{
+  \clearpage
+  \pagenumbering{gobble}
+  \thispagestyle{empty}
+  \vspace*{\stretch{1}}
+  \itshape
+  \raggedleft
+}
+{
+  \par
+  \vspace{\stretch{3}}
+  \clearpage
+  \pagenumbering{arabic}
+}
+
+\begin{document}
+
+% -------------------------------------------------
+% Frontespizio
+% -------------------------------------------------
+\newgeometry{hmarginratio=1:1,top=3cm,bottom=3cm}
+
+\begin{titlepage}
+  \begin{center}
+    {\Large{\textsc{Alma Mater Studiorum - Università di Bologna}}}\\
+
+    \vspace{5mm}
+
+    {\small
+    Dipartimento di Informatica - Scienza e Ingegneria\\
+    Corso di Laurea in Ingegneria e Scienze Informatiche
+    }
+  \end{center}
+
+  \vspace{18mm}
+
+  \begin{center}
+    {\Large\textsc{
+    Framework decisionale per il superamento sicuro di ostacoli nella guida autonoma
+    }}
+  \end{center}
+
+  \vspace{20mm}
+
+  \begin{center}
+    \large{Elaborato in\\
+    Programmazione}
+  \end{center}
+
+  \vspace{30mm}
+
+  \noindent
+  \begin{minipage}[t]{0.47\textwidth}
+    {\large{\bf Relatore:\\
+    Roberto Girau\\[4mm]}}
+
+    {\large{\bf Correlatore:\\
+    Andrea Bedei}}
+  \end{minipage}
+  \hfill
+  \begin{minipage}[t]{0.47\textwidth}
+    \raggedleft
+    {\large{\bf Presentata da:\\
+    Davide Amantini}}
+  \end{minipage}
+
+  \vfill
+
+  \begin{center}
+    {\large{\bf Sessione Luglio 2026\\
+    Anno Accademico 2025/2026}}
+  \end{center}
+\end{titlepage}
+
+\restoregeometry
+
+% Pagina bianca dopo il frontespizio
+\clearpage
+\null
+\thispagestyle{empty}
+\newpage
+
+% -------------------------------------------------
+% Indici
+% -------------------------------------------------
+\pagenumbering{roman}
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+\cleardoublepage
+
+% -------------------------------------------------
+% Corpo della tesi
+% -------------------------------------------------
+\pagenumbering{arabic}
+
+\input{00-sommario.tex}
+\input{01-introduzione.tex}
+\input{02-stato-dell-arte.tex}
+\input{03-analisi-del-problema.tex}
+\input{04-architettura-del-sistema.tex}
+\input{05-framework-decisionale.tex}
+\input{06-controllo-pid-mpc.tex}
+\input{07-implementazione.tex}
+\input{08-risultati-sperimentali.tex}
+\input{09-sviluppi-futuri.tex}
+\input{10-conclusioni.tex}
+
+% -------------------------------------------------
+% Ringraziamenti
+% -------------------------------------------------
+\cleardoublepage
+\chapter*{Ringraziamenti}
+\addcontentsline{toc}{chapter}{Ringraziamenti}
+
+Desidero ringraziare il relatore Roberto Girau e il correlatore Andrea Bedei per il supporto fornito durante lo svolgimento di questo lavoro. Un ringraziamento va inoltre a tutte le persone che mi hanno aiutato nel percorso universitario e nella realizzazione degli esperimenti, offrendo tempo, confronto e sostegno.
+
+% -------------------------------------------------
+% Bibliografia
+% -------------------------------------------------
+\cleardoublepage
+\bibliographystyle{IEEEtran}
+\bibliography{export}
+
+\end{document}

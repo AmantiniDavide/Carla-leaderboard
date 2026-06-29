@@ -1,0 +1,98 @@
+\chapter{Architettura del sistema}
+
+\section{Visione generale}
+
+L'architettura del sistema sviluppato nella tesi può essere descritta come una pipeline modulare che parte dalla simulazione e termina nella generazione dei comandi di guida e nella raccolta delle metriche. Il flusso generale è il seguente:
+
+\begin{itemize}
+    \item ambiente di simulazione;
+    \item acquisizione dello stato del veicolo e dell'ambiente;
+    \item modulo decisionale;
+    \item generazione della traiettoria;
+    \item controllore PID o MPC;
+    \item aggiornamento del veicolo;
+    \item raccolta dei dati sperimentali.
+\end{itemize}
+
+L'ambiente di simulazione è fornito da CARLA Leaderboard, che gestisce mappa, route, scenario e fisica del veicolo \cite{dosovitskiy2017carla}. L'agente sviluppato nella tesi si inserisce in questo contesto come modulo di decisione e controllo: legge i sensori, aggiorna lo stato della manovra, modifica il piano locale quando necessario e produce il comando finale di sterzo, accelerazione e frenata.
+
+\section{Input del sistema}
+
+A ogni iterazione il sistema riceve un insieme di informazioni provenienti dai sensori e dalla mappa. Gli input principali sono:
+
+\begin{itemize}
+    \item posizione del veicolo ego;
+    \item velocità del veicolo ego;
+    \item orientamento del veicolo ego;
+    \item posizione dell'ostacolo rispetto al veicolo;
+    \item posizione e velocità dei veicoli circostanti;
+    \item geometria delle corsie tramite waypoint della mappa;
+    \item stato corrente della macchina a stati.
+\end{itemize}
+
+Nel progetto questi dati sono ottenuti combinando sensori virtuali di CARLA e informazioni della mappa. In particolare, sono utilizzati una camera frontale RGB, una camera laterale sinistra, una camera posteriore, un radar anteriore, un radar posteriore e uno speedometer. La mappa di CARLA fornisce inoltre waypoint e identificativi di corsia utili a distinguere corsia originale e corsia di sorpasso.
+
+\section{Modulo decisionale}
+
+Il modulo decisionale è responsabile della scelta dell'azione di alto livello da eseguire. Non genera direttamente i comandi di sterzo o di accelerazione, ma stabilisce in quale fase della manovra si trovi il sistema e quale piano locale debba essere seguito. Le azioni di alto livello che il modulo può selezionare sono, in sostanza:
+
+\begin{itemize}
+    \item mantenere la corsia;
+    \item rallentare o arrestarsi in prossimità dell'ostacolo;
+    \item iniziare il cambio corsia verso sinistra;
+    \item proseguire il sorpasso nella corsia laterale;
+    \item rientrare nella corsia originale;
+    \item attivare una frenata di sicurezza in caso di situazione critica.
+\end{itemize}
+
+Questo modulo è implementato come macchina a stati finiti, in modo da separare chiaramente la logica di transizione tra le varie fasi dal problema del controllo continuo.
+
+\section{Generazione della traiettoria}
+
+La traiettoria da seguire non è definita come una curva geometrica analitica unica, ma come una sequenza di waypoint e segmenti di piano locale derivati dalla route originale. Quando il veicolo deve sorpassare, il sistema salva il piano residuo della route e costruisce un piano temporaneo composto da tre parti:
+
+\begin{itemize}
+    \item un breve tratto iniziale ancora sulla corsia corrente;
+    \item un segmento di cambio corsia verso la corsia laterale;
+    \item un tratto di percorrenza sulla corsia di sorpasso.
+\end{itemize}
+
+Per il rientro viene costruito un piano analogo, eventualmente sfruttando un piano di rejoin dedicato. In questo modo la traiettoria è ottenuta tramite punti di riferimento e cambio progressivo della corsia target, senza introdurre un pianificatore globale separato dal sistema già offerto da CARLA.
+
+\section{Modulo di controllo}
+
+Il controllore riceve il piano locale attivo e produce i comandi necessari a seguirlo. Nel progetto sono state considerate due modalità:
+
+\begin{itemize}
+    \item controllore PID;
+    \item controllore MPC.
+\end{itemize}
+
+Nel caso PID il comando è ottenuto dal \textit{BasicAgent} di CARLA, opportunamente configurato. Nel caso MPC, invece, il piano locale generato dalla stessa logica decisionale viene seguito da un controllore predittivo per il canale laterale e, durante le fasi della manovra, anche da un controllore predittivo longitudinale. Il confronto dettagliato tra i due approcci è discusso nel Capitolo 6.
+
+\section{Output del sistema}
+
+Gli output prodotti dal sistema non si limitano al solo comando applicato al veicolo. A ogni iterazione l'agente genera infatti:
+
+\begin{itemize}
+    \item comando di sterzo;
+    \item comando di accelerazione o frenata;
+    \item stato decisionale corrente;
+    \item traiettoria o piano locale seguito;
+    \item indicatori di sicurezza;
+    \item log sperimentali frame-by-frame.
+\end{itemize}
+
+Questo insieme di output consente sia l'esecuzione della manovra sia la successiva analisi quantitativa del comportamento.
+
+\section{Flusso operativo}
+
+Il ciclo operativo del sistema può essere riassunto come segue. A ogni passo temporale l'agente acquisisce i dati dei sensori, ricostruisce una stima locale della situazione, aggiorna la macchina a stati, verifica se sia necessario modificare il piano locale, seleziona il controllore attivo e produce il comando finale. Prima che il comando venga restituito al simulatore, esso può essere ulteriormente corretto da override di sicurezza, per esempio in presenza di rischio di collisione imminente.
+
+Infine, tutte le variabili rilevanti vengono salvate nel logger: stato della manovra, errori di tracking, comandi di controllo, tempi computazionali, distanze di sicurezza e indicatori di rischio. Questo flusso rende il sistema adatto non solo all'esecuzione, ma anche al confronto sperimentale tra controller diversi.
+
+\section{Modularità dell'architettura}
+
+Una caratteristica importante del progetto è la modularità. Il framework decisionale, i sensori usati e la generazione del piano locale restano sostanzialmente invariati quando si passa dal PID all'MPC. Ciò significa che la differenza osservata nei risultati sperimentali può essere attribuita in larga misura al diverso comportamento del controllore e non a variazioni arbitrarie nella logica di alto livello.
+
+Questa separazione è particolarmente utile per il confronto accademico sviluppato nella tesi. Entrambi i controllori ricevono infatti lo stesso riferimento di manovra, ma lo eseguono con proprietà dinamiche diverse: il PID in modo più reattivo e leggero dal punto di vista computazionale, l'MPC in modo più predittivo e regolare.

@@ -268,6 +268,11 @@ class MyAgent(AutonomousAgent):
             status="basic_agent_longitudinal"
         )
         self._basic_agent_hazard_brake_threshold = 0.49
+        self._basic_agent_max_throttle = 0.75
+        self._basic_agent_max_brake = 0.30
+        self._basic_agent_longitudinal_kp = 1.0
+        self._basic_agent_longitudinal_ki = 0.05
+        self._basic_agent_longitudinal_kd = 0.0
         self._mpc_controller = None
         self._mpc_longitudinal_controller = None
         self._mpc_horizon_steps = 12
@@ -304,6 +309,9 @@ class MyAgent(AutonomousAgent):
         self._last_debug_timestamp = -1.0
         self._sensor_snapshot_logged = False
         self._forward_camera_pitch = 0.0
+        self._front_radar_mount_yaw_deg = 0.0
+        self._front_radar_horizontal_fov_deg = 25.0
+        self._front_radar_vertical_fov_deg = 10.0
         self._front_radar_min_depth = 1.0
         self._front_radar_max_depth = 25.0
         self._front_radar_max_abs_azimuth = np.deg2rad(10.0)
@@ -339,8 +347,12 @@ class MyAgent(AutonomousAgent):
         self._rejoin_radar_max_abs_azimuth = np.deg2rad(35.0)
         self._rejoin_radar_min_forward_distance = 1.5
         self._rejoin_radar_min_points = 2
+        self._rejoin_radar_cluster_depth_window = 2.0
+        self._rejoin_radar_cluster_azimuth_window = np.deg2rad(6.0)
+        self._rejoin_radar_cluster_min_points = 3
+        self._rejoin_radar_clear_distance_m = 10.5
         self._rejoin_lane_lateral_margin = 1.5
-        self._rejoin_clear_hold_time = 0.8
+        self._rejoin_clear_hold_time = 0.55
         self._front_vehicle_min_confidence = 0.45
         self._front_vehicle_center_x_min = 0.30
         self._front_vehicle_center_x_max = 0.70
@@ -397,7 +409,7 @@ class MyAgent(AutonomousAgent):
         self._return_same_lane_distance = 4.0
         self._return_lane_change_distance = 8.0
         self._return_other_lane_distance = 8.0
-        self._min_left_lane_time = 1.5
+        self._min_left_lane_time = 1.7
         self._min_right_lane_settle_time = 0.4
         self._post_overtake_cooldown_time = 2.0
         self._route_rejoin_min_distance = 8.0
@@ -470,9 +482,9 @@ class MyAgent(AutonomousAgent):
                 "z": 1.0,
                 "roll": 0.0,
                 "pitch": 0.0,
-                "yaw": 0.0,
-                "horizontal_fov": 25,
-                "vertical_fov": 10,
+                "yaw": self._front_radar_mount_yaw_deg,
+                "horizontal_fov": self._front_radar_horizontal_fov_deg,
+                "vertical_fov": self._front_radar_vertical_fov_deg,
                 "id": "FrontRdr",
             },
             {
@@ -528,6 +540,7 @@ class MyAgent(AutonomousAgent):
         )
         raw_front_radar_points = front_radar[1] if front_radar is not None else None
         raw_rear_radar_points = rear_radar[1] if rear_radar is not None else None
+        raw_front_radar_points = self._normalize_front_radar_points(raw_front_radar_points)
         front_radar_points = self._extract_front_cluster(raw_front_radar_points)
         rear_radar_points = self._extract_rear_cluster(raw_rear_radar_points)
         front_vehicle_state = self._estimate_front_vehicle_state(
@@ -574,10 +587,25 @@ class MyAgent(AutonomousAgent):
             if self._hero_actor is None:
                 return carla.VehicleControl()
 
+            agent_opt_dict = {"ignore_vehicles": True}
+            if self._controller_mode != "mpc":
+                agent_opt_dict.update(
+                    {
+                        "max_throttle": self._basic_agent_max_throttle,
+                        "max_brake": self._basic_agent_max_brake,
+                        "longitudinal_control_dict": {
+                            "K_P": self._basic_agent_longitudinal_kp,
+                            "K_I": self._basic_agent_longitudinal_ki,
+                            "K_D": self._basic_agent_longitudinal_kd,
+                            "dt": 1.0 / 20.0,
+                        },
+                    }
+                )
+
             self._agent = BasicAgent(
                 self._hero_actor,
                 self._target_speed,
-                opt_dict={"ignore_vehicles": True},
+                opt_dict=agent_opt_dict,
             )
             self._ensure_runtime_controller()
             self._active_target_speed = self._target_speed
@@ -940,9 +968,17 @@ class MyAgent(AutonomousAgent):
 
     def _run_selected_controller(self, speed_mps, current_waypoint=None, front_vehicle_state=None):
         if self._controller_mode != "mpc":
+            controller_started_at = time.perf_counter()
             base_control = self._agent.run_step()
-            self._set_controller_diagnostics(status="basic_agent_pid")
-            self._set_longitudinal_controller_diagnostics(status="basic_agent_longitudinal")
+            elapsed_ms = (time.perf_counter() - controller_started_at) * 1000.0
+            self._set_controller_diagnostics(
+                compute_time_ms=elapsed_ms,
+                status="basic_agent_pid",
+            )
+            self._set_longitudinal_controller_diagnostics(
+                compute_time_ms=elapsed_ms,
+                status="basic_agent_longitudinal",
+            )
             return base_control
 
         longitudinal_reference = self._build_mpc_longitudinal_reference(
@@ -2048,7 +2084,22 @@ class MyAgent(AutonomousAgent):
             rejoin_waypoint,
             raw_front_radar_points,
         )
-        return len(rejoin_lane_points) < self._rejoin_radar_min_points
+        if len(rejoin_lane_points) < self._rejoin_radar_min_points:
+            return True
+
+        rejoin_cluster = self._cluster_nearest_target(
+            rejoin_lane_points,
+            depth_window=self._rejoin_radar_cluster_depth_window,
+            azimuth_window=self._rejoin_radar_cluster_azimuth_window,
+        )
+
+        # Treat sparse or incoherent echoes as noise and block rejoin only on a
+        # nearby, stable target aligned with the destination lane.
+        if rejoin_cluster is None or len(rejoin_cluster) < self._rejoin_radar_cluster_min_points:
+            return True
+
+        nearest_forward_m = float(np.min(rejoin_cluster[:, 0] * np.cos(rejoin_cluster[:, 2])))
+        return nearest_forward_m > self._rejoin_radar_clear_distance_m
 
     def _finish_overtake(self, current_waypoint, timestamp):
         using_helper_rejoin_plan = self._using_helper_rejoin_plan
@@ -2452,6 +2503,21 @@ class MyAgent(AutonomousAgent):
             mask &= np.abs(points[:, 2]) <= max_abs_azimuth
 
         return points[mask]
+
+    def _normalize_front_radar_points(self, points):
+        if points is None or len(points) == 0:
+            return points
+
+        yaw_bias_rad = np.deg2rad(float(self._front_radar_mount_yaw_deg))
+        if abs(yaw_bias_rad) <= 1e-6:
+            return points
+
+        normalized_points = np.asarray(points).copy()
+        normalized_points[:, 2] = np.arctan2(
+            np.sin(normalized_points[:, 2] + yaw_bias_rad),
+            np.cos(normalized_points[:, 2] + yaw_bias_rad),
+        )
+        return normalized_points
 
     @staticmethod
     def _cluster_nearest_target(filtered_points, depth_window, azimuth_window):
@@ -2865,6 +2931,28 @@ class MyAgent(AutonomousAgent):
                     "target_speed_kph": self._target_speed,
                     "camera_width": self.camera_width,
                     "camera_height": self.camera_height,
+                    "basic_agent_max_throttle": self._basic_agent_max_throttle,
+                    "basic_agent_max_brake": self._basic_agent_max_brake,
+                    "basic_agent_longitudinal_kp": self._basic_agent_longitudinal_kp,
+                    "basic_agent_longitudinal_ki": self._basic_agent_longitudinal_ki,
+                    "basic_agent_longitudinal_kd": self._basic_agent_longitudinal_kd,
+                    "front_radar_mount_yaw_deg": self._front_radar_mount_yaw_deg,
+                    "front_radar_horizontal_fov_deg": self._front_radar_horizontal_fov_deg,
+                    "front_radar_vertical_fov_deg": self._front_radar_vertical_fov_deg,
+                    "front_radar_trigger_distance_m": self._front_radar_trigger_distance,
+                    "front_radar_resume_distance_m": self._front_radar_resume_distance,
+                    "sensor_soft_brake": self._sensor_soft_brake,
+                    "sensor_stop_brake": self._sensor_stop_brake,
+                    "sensor_close_brake": self._sensor_close_brake,
+                    "sensor_emergency_brake": self._sensor_emergency_brake,
+                    "rejoin_radar_cluster_depth_window_m": self._rejoin_radar_cluster_depth_window,
+                    "rejoin_radar_cluster_azimuth_window_deg": np.rad2deg(
+                        self._rejoin_radar_cluster_azimuth_window
+                    ),
+                    "rejoin_radar_cluster_min_points": self._rejoin_radar_cluster_min_points,
+                    "rejoin_radar_clear_distance_m": self._rejoin_radar_clear_distance_m,
+                    "rejoin_clear_hold_time_s": self._rejoin_clear_hold_time,
+                    "min_left_lane_time_s": self._min_left_lane_time,
                     "mpc_horizon_steps": self._mpc_horizon_steps if self._controller_mode == "mpc" else None,
                     "mpc_prediction_dt": self._mpc_prediction_dt if self._controller_mode == "mpc" else None,
                     "mpc_longitudinal_horizon_steps": (
@@ -3137,6 +3225,22 @@ class MyAgent(AutonomousAgent):
                         self._controller_mode_explicit = True
                     elif key == "controller_name":
                         self._controller_name = value or self._controller_name
+                    elif key == "basic_agent_max_throttle":
+                        self._basic_agent_max_throttle = min(max(float(value), 0.0), 1.0)
+                    elif key == "basic_agent_max_brake":
+                        self._basic_agent_max_brake = min(max(float(value), 0.0), 1.0)
+                    elif key == "basic_agent_longitudinal_kp":
+                        self._basic_agent_longitudinal_kp = max(float(value), 0.0)
+                    elif key == "basic_agent_longitudinal_ki":
+                        self._basic_agent_longitudinal_ki = max(float(value), 0.0)
+                    elif key == "basic_agent_longitudinal_kd":
+                        self._basic_agent_longitudinal_kd = max(float(value), 0.0)
+                    elif key == "front_radar_mount_yaw_deg":
+                        self._front_radar_mount_yaw_deg = float(value)
+                    elif key == "front_radar_horizontal_fov_deg":
+                        self._front_radar_horizontal_fov_deg = max(float(value), 1.0)
+                    elif key == "front_radar_vertical_fov_deg":
+                        self._front_radar_vertical_fov_deg = max(float(value), 1.0)
                     elif key == "mpc_horizon_steps":
                         self._mpc_horizon_steps = max(int(value), 4)
                     elif key == "mpc_prediction_dt":
@@ -3253,6 +3357,30 @@ class MyAgent(AutonomousAgent):
                         self._front_vehicle_ttc_brake_s = max(float(value), 0.1)
                     elif key == "front_vehicle_ttc_emergency_s":
                         self._front_vehicle_ttc_emergency_s = max(float(value), 0.1)
+                    elif key == "front_radar_trigger_distance_m":
+                        self._front_radar_trigger_distance = max(float(value), 0.0)
+                    elif key == "front_radar_resume_distance_m":
+                        self._front_radar_resume_distance = max(float(value), 0.0)
+                    elif key == "sensor_soft_brake":
+                        self._sensor_soft_brake = min(max(float(value), 0.0), 1.0)
+                    elif key == "sensor_stop_brake":
+                        self._sensor_stop_brake = min(max(float(value), 0.0), 1.0)
+                    elif key == "sensor_close_brake":
+                        self._sensor_close_brake = min(max(float(value), 0.0), 1.0)
+                    elif key == "sensor_emergency_brake":
+                        self._sensor_emergency_brake = min(max(float(value), 0.0), 1.0)
+                    elif key == "rejoin_radar_cluster_depth_window_m":
+                        self._rejoin_radar_cluster_depth_window = max(float(value), 0.1)
+                    elif key == "rejoin_radar_cluster_azimuth_window_deg":
+                        self._rejoin_radar_cluster_azimuth_window = np.deg2rad(max(float(value), 0.1))
+                    elif key == "rejoin_radar_cluster_min_points":
+                        self._rejoin_radar_cluster_min_points = max(int(value), 1)
+                    elif key == "rejoin_radar_clear_distance_m":
+                        self._rejoin_radar_clear_distance_m = max(float(value), 0.0)
+                    elif key == "rejoin_clear_hold_time_s":
+                        self._rejoin_clear_hold_time = max(float(value), 0.0)
+                    elif key == "min_left_lane_time_s":
+                        self._min_left_lane_time = max(float(value), 0.0)
                     elif key == "rear_approach_ttc_threshold_s":
                         self._rear_approach_ttc_threshold_s = max(float(value), 0.1)
                     elif key == "rear_approach_close_distance":

@@ -1,0 +1,84 @@
+\babel@toc {italian}{}\relax 
+\babel@toc {italian}{}\relax 
+\contentsline {chapter}{Sommario}{1}{chapter*.4}%
+\contentsline {chapter}{\numberline {1}Introduzione}{4}{chapter.1}%
+\contentsline {section}{\numberline {1.1}Contesto}{4}{section.1.1}%
+\contentsline {section}{\numberline {1.2}Motivazione}{5}{section.1.2}%
+\contentsline {section}{\numberline {1.3}Problema affrontato}{6}{section.1.3}%
+\contentsline {section}{\numberline {1.4}Obiettivi della tesi}{7}{section.1.4}%
+\contentsline {section}{\numberline {1.5}Contributi principali}{8}{section.1.5}%
+\contentsline {section}{\numberline {1.6}Struttura della tesi}{8}{section.1.6}%
+\contentsline {chapter}{\numberline {2}Stato dell'arte}{10}{chapter.2}%
+\contentsline {section}{\numberline {2.1}Guida autonoma}{10}{section.2.1}%
+\contentsline {section}{\numberline {2.2}Percezione e rilevamento degli ostacoli}{11}{section.2.2}%
+\contentsline {section}{\numberline {2.3}Obstacle avoidance nella guida autonoma}{12}{section.2.3}%
+\contentsline {section}{\numberline {2.4}Cambio corsia e sorpasso}{12}{section.2.4}%
+\contentsline {section}{\numberline {2.5}Metriche di sicurezza}{13}{section.2.5}%
+\contentsline {section}{\numberline {2.6}Controllo laterale e longitudinale del veicolo}{14}{section.2.6}%
+\contentsline {section}{\numberline {2.7}Controllori PID}{15}{section.2.7}%
+\contentsline {section}{\numberline {2.8}Model Predictive Control}{16}{section.2.8}%
+\contentsline {chapter}{\numberline {3}Analisi del problema}{17}{chapter.3}%
+\contentsline {section}{\numberline {3.1}Descrizione dello scenario}{17}{section.3.1}%
+\contentsline {section}{\numberline {3.2}Veicolo ego e ambiente circostante}{18}{section.3.2}%
+\contentsline {section}{\numberline {3.3}Ipotesi operative}{19}{section.3.3}%
+\contentsline {section}{\numberline {3.4}Variabili considerate}{20}{section.3.4}%
+\contentsline {section}{\numberline {3.5}Condizioni di sicurezza}{21}{section.3.5}%
+\contentsline {section}{\numberline {3.6}Casi sicuri e casi non sicuri}{22}{section.3.6}%
+\contentsline {section}{\numberline {3.7}Requisiti funzionali}{23}{section.3.7}%
+\contentsline {section}{\numberline {3.8}Requisiti non funzionali}{23}{section.3.8}%
+\contentsline {chapter}{\numberline {4}Architettura del sistema}{25}{chapter.4}%
+\contentsline {section}{\numberline {4.1}Visione generale}{25}{section.4.1}%
+\contentsline {section}{\numberline {4.2}Input del sistema}{26}{section.4.2}%
+\contentsline {section}{\numberline {4.3}Modulo decisionale}{27}{section.4.3}%
+\contentsline {section}{\numberline {4.4}Generazione della traiettoria}{27}{section.4.4}%
+\contentsline {section}{\numberline {4.5}Modulo di controllo}{28}{section.4.5}%
+\contentsline {section}{\numberline {4.6}Output del sistema}{29}{section.4.6}%
+\contentsline {section}{\numberline {4.7}Flusso operativo}{29}{section.4.7}%
+\contentsline {section}{\numberline {4.8}Modularità dell'architettura}{30}{section.4.8}%
+\contentsline {chapter}{\numberline {5}Framework decisionale}{31}{chapter.5}%
+\contentsline {section}{\numberline {5.1}Obiettivo del framework}{31}{section.5.1}%
+\contentsline {section}{\numberline {5.2}Informazioni usate nella decisione}{32}{section.5.2}%
+\contentsline {section}{\numberline {5.3}Macchina a stati}{32}{section.5.3}%
+\contentsline {section}{\numberline {5.4}Attivazione del sorpasso}{33}{section.5.4}%
+\contentsline {section}{\numberline {5.5}Gestione della fase di attesa}{34}{section.5.5}%
+\contentsline {section}{\numberline {5.6}Fase di superamento}{35}{section.5.6}%
+\contentsline {section}{\numberline {5.7}Logica di rientro}{35}{section.5.7}%
+\contentsline {section}{\numberline {5.8}Fail-safe e override di sicurezza}{36}{section.5.8}%
+\contentsline {section}{\numberline {5.9}Considerazioni sul framework}{37}{section.5.9}%
+\contentsline {chapter}{\numberline {6}Controllo PID e MPC}{38}{chapter.6}%
+\contentsline {section}{\numberline {6.1}Ruolo del controllo nella manovra}{38}{section.6.1}%
+\contentsline {section}{\numberline {6.2}Controllo laterale e longitudinale}{39}{section.6.2}%
+\contentsline {section}{\numberline {6.3}Controllore PID}{39}{section.6.3}%
+\contentsline {section}{\numberline {6.4}Taratura del PID}{40}{section.6.4}%
+\contentsline {section}{\numberline {6.5}Model Predictive Control}{42}{section.6.5}%
+\contentsline {section}{\numberline {6.6}Funzione costo dell'MPC}{43}{section.6.6}%
+\contentsline {section}{\numberline {6.7}Vincoli dell'MPC}{44}{section.6.7}%
+\contentsline {section}{\numberline {6.8}Criteri di confronto tra PID e MPC}{45}{section.6.8}%
+\contentsline {section}{\numberline {6.9}Aspettative sul confronto}{46}{section.6.9}%
+\contentsline {chapter}{\numberline {7}Implementazione}{47}{chapter.7}%
+\contentsline {section}{\numberline {7.1}Ambiente di sviluppo}{47}{section.7.1}%
+\contentsline {section}{\numberline {7.2}Struttura del codice}{48}{section.7.2}%
+\contentsline {section}{\numberline {7.3}Rappresentazione dello scenario}{49}{section.7.3}%
+\contentsline {section}{\numberline {7.4}Implementazione del framework decisionale}{50}{section.7.4}%
+\contentsline {section}{\numberline {7.5}Implementazione del cambio corsia}{50}{section.7.5}%
+\contentsline {section}{\numberline {7.6}Implementazione del controllore PID}{51}{section.7.6}%
+\contentsline {section}{\numberline {7.7}Implementazione del controllore MPC}{52}{section.7.7}%
+\contentsline {chapter}{\numberline {8}Risultati sperimentali}{54}{chapter.8}%
+\contentsline {section}{\numberline {8.1}Obiettivo della valutazione}{54}{section.8.1}%
+\contentsline {section}{\numberline {8.2}Scenari di test}{54}{section.8.2}%
+\contentsline {section}{\numberline {8.3}Metriche di valutazione}{56}{section.8.3}%
+\contentsline {section}{\numberline {8.4}Risultati del framework decisionale}{56}{section.8.4}%
+\contentsline {section}{\numberline {8.5}Risultati con controllo PID}{57}{section.8.5}%
+\contentsline {section}{\numberline {8.6}Risultati con controllo MPC}{59}{section.8.6}%
+\contentsline {section}{\numberline {8.7}Confronto tra PID e MPC}{60}{section.8.7}%
+\contentsline {section}{\numberline {8.8}Discussione dei risultati}{61}{section.8.8}%
+\contentsline {section}{\numberline {8.9}Limiti sperimentali}{62}{section.8.9}%
+\contentsline {chapter}{\numberline {9}Sviluppi futuri}{63}{chapter.9}%
+\contentsline {section}{\numberline {9.1}Miglioramento della percezione}{63}{section.9.1}%
+\contentsline {section}{\numberline {9.2}Scenari stradali più complessi}{64}{section.9.2}%
+\contentsline {section}{\numberline {9.3}Predizione del comportamento degli altri veicoli}{65}{section.9.3}%
+\contentsline {section}{\numberline {9.4}Miglioramento della pianificazione della traiettoria}{65}{section.9.4}%
+\contentsline {section}{\numberline {9.5}Estensione del confronto tra controllori}{66}{section.9.5}%
+\contentsline {section}{\numberline {9.6}Validazione su veicolo reale}{67}{section.9.6}%
+\contentsline {chapter}{\numberline {10}Conclusioni}{68}{chapter.10}%
+\contentsline {chapter}{Ringraziamenti}{70}{chapter*.13}%

@@ -1,0 +1,59 @@
+\chapter{Introduzione}
+
+\section{Contesto}
+
+La guida autonoma richiede l'integrazione di moduli eterogenei che operano in modo coordinato: percezione dell'ambiente, localizzazione del veicolo, pianificazione del percorso, decisione della manovra e controllo dei comandi di guida. In un veicolo autonomo questi moduli non possono essere considerati separatamente, perché una decisione corretta a livello logico deve tradursi in un comportamento fisicamente eseguibile, stabile e sicuro. In letteratura questa catena decisione-controllo viene spesso trattata come uno degli aspetti centrali dei sistemi di self-driving, soprattutto nei contesti urbani e semi-urbani, nei quali il traffico e gli ostacoli possono cambiare rapidamente \cite{paden2016survey}.
+
+All'interno di questo quadro generale, la presente tesi si concentra su un problema circoscritto ma significativo: il superamento sicuro di un ostacolo posto sulla corsia di marcia. Il tema viene affrontato in ambiente simulato, utilizzando il framework CARLA Leaderboard come base sperimentale \cite{dosovitskiy2017carla}. Pur partendo da alcuni componenti già disponibili nel simulatore, il lavoro svolto non si limita a usarli in modo passivo: essi sono stati adattati, coordinati ed estesi fino a ottenere un sistema completo e funzionante per il caso di studio considerato, capace di prendere decisioni, eseguire la manovra, raccogliere metriche e supportare un confronto sperimentale strutturato tra controllori diversi.
+
+\section{Motivazione}
+
+Il superamento di un ostacolo rappresenta una manovra interessante perché combina una componente decisionale di alto livello con una componente di controllo a basso livello. Non si tratta soltanto di deviare lateralmente dalla traiettoria nominale, ma di valutare se la manovra sia davvero praticabile nelle condizioni correnti. Il veicolo deve stimare se la corsia alternativa sia disponibile, se un veicolo proveniente da dietro possa rendere pericoloso il cambio corsia, se vi siano veicoli frontali nella corsia di sorpasso e se esista spazio sufficiente per rientrare.
+
+Una decisione errata in questa fase può produrre effetti critici: collisioni laterali con veicoli che sopraggiungono, urti frontali con veicoli in senso opposto, frenate improvvise troppo vicine all'ostacolo o rientri tardivi nella corsia originaria. Per questo motivo la manovra di sorpasso è un caso di studio adatto a mettere in evidenza la relazione tra logica decisionale, margini di sicurezza e qualità del controllo del veicolo.
+
+\section{Problema affrontato}
+
+Lo scenario affrontato in questa tesi è il seguente: il veicolo ego percorre la propria corsia, rileva un ostacolo fermo davanti a sé e deve decidere se attendere o se iniziare una manovra di superamento mediante cambio corsia. La decisione non dipende solo dalla presenza dell'ostacolo, ma anche dallo stato della corsia adiacente e dall'evoluzione attesa della situazione circostante.
+
+In particolare, la logica sviluppata considera almeno tre aspetti fondamentali:
+
+\begin{itemize}
+    \item la distanza dall'ostacolo sulla corsia corrente e il margine disponibile per rallentare o arrestarsi;
+    \item la presenza di veicoli posteriori nella corsia di destinazione, che possono rendere pericoloso l'inserimento;
+    \item la presenza di veicoli frontali nella corsia di destinazione o nella corsia opposta, che possono impedire il sorpasso o imporre una fase di attesa.
+\end{itemize}
+
+Una volta superato l'ostacolo, il sistema deve anche stabilire quando sia sicuro rientrare nella corsia originale. Il problema affrontato, quindi, non coincide con il solo cambio corsia iniziale, ma comprende l'intero ciclo della manovra: rilevamento del blocco, attesa, uscita dalla corsia, fase di superamento, rientro e stabilizzazione finale.
+
+\section{Obiettivi della tesi}
+
+L'obiettivo generale del lavoro è progettare e validare un framework decisionale per il superamento sicuro di ostacoli in un contesto simulato, separando chiaramente il livello decisionale dal livello di controllo. Più nel dettaglio, il lavoro si propone di:
+
+\begin{itemize}
+    \item progettare un framework decisionale per il superamento sicuro di ostacoli;
+    \item modellare la manovra attraverso una macchina a stati;
+    \item definire regole di sicurezza basate su distanze, velocità relative e tempi disponibili;
+    \item implementare la logica decisionale in ambiente simulato;
+    \item confrontare un controllore PID e un controllore MPC durante l'esecuzione della manovra;
+    \item valutare il sistema mediante scenari sperimentali rappresentativi.
+\end{itemize}
+
+La tesi non si limita quindi alla semplice esecuzione di una route, ma porta alla realizzazione di un agente sperimentale completo per la manovra di sorpasso, nel quale scenari, logica decisionale, gestione dei sensori, controllo e raccolta dei risultati vengono fatti lavorare come un unico sistema coerente.
+
+\section{Contributi principali}
+
+I contributi principali del lavoro sono concreti e riguardano sia l'implementazione dell'agente sia la costruzione della pipeline sperimentale. In particolare, durante lo sviluppo sono stati realizzati:
+
+\begin{itemize}
+    \item la definizione di tre scenari sperimentali di sorpasso in ambiente CARLA Leaderboard, con ostacolo statico e diversi livelli di interferenza del traffico;
+    \item la progettazione di una macchina a stati per gestire le fasi \texttt{follow\_lane}, \texttt{waiting\_left}, \texttt{changing\_left}, \texttt{passing} e \texttt{changing\_right};
+    \item l'integrazione di una logica di sicurezza basata su radar anteriore, radar posteriore, rilevamento di veicoli laterali e regole su distanza dinamica e Time To Collision;
+    \item l'integrazione di due modalità di controllo alternative, una basata sul controllore PID del \textit{BasicAgent} di CARLA e una basata su un controllore MPC implementato ad hoc;
+    \item la raccolta automatica di log frame-by-frame e la definizione di metriche per il confronto tra PID e MPC;
+    \item la generazione automatica di tabelle, grafici e artefatti utilizzabili direttamente nella stesura della tesi.
+\end{itemize}
+
+\section{Struttura della tesi}
+
+Il Capitolo 2 presenta lo stato dell'arte relativo alla guida autonoma, al cambio corsia e alle tecniche di controllo considerate. Il Capitolo 3 descrive il problema affrontato, le ipotesi operative e i requisiti del sistema. Il Capitolo 4 illustra l'architettura generale dell'agente e il flusso informativo tra sensori, decisione e controllo. Il Capitolo 5 descrive il framework decisionale e la macchina a stati implementata per il sorpasso. Il Capitolo 6 presenta i principi dei controllori PID e MPC adottati nel progetto. Il Capitolo 7 descrive i dettagli implementativi dell'agente, dei controller e della pipeline di logging. Il Capitolo 8 riporta i risultati sperimentali e il confronto quantitativo tra i due approcci. I Capitoli 9 e 10 discutono gli sviluppi futuri e le conclusioni del lavoro.

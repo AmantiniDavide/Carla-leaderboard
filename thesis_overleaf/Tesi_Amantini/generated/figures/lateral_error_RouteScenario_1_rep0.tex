@@ -1,0 +1,18 @@
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            width=0.88\textwidth,
+            xlabel={$t$ [s]},
+            ylabel={Errore laterale [m]},
+            legend pos=north east,
+            grid=major,
+        ]
+            \addplot[blue, thick] table[x=t_rel_s,y=lateral_error_m,col sep=comma]{generated/data/basic_agent__RouteScenario_1_rep0_tracking.csv};
+            \addlegendentry{PID}
+            \addplot[red, thick] table[x=t_rel_s,y=lateral_error_m,col sep=comma]{generated/data/mpc__RouteScenario_1_rep0_tracking.csv};
+            \addlegendentry{MPC}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Errore laterale nel tempo nello scenario 1 per PID e MPC.}
+\end{figure}

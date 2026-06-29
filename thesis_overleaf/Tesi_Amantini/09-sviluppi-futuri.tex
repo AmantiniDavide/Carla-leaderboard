@@ -1,0 +1,80 @@
+\chapter{Sviluppi futuri}
+
+\section{Miglioramento della percezione}
+
+Il sistema sviluppato nella tesi utilizza una percezione semplificata ma funzionale al problema del sorpasso. Un primo sviluppo futuro naturale consiste nell'estendere questo livello con una sensor fusion più realistica. In particolare, il framework potrebbe essere arricchito mediante:
+
+\begin{itemize}
+    \item uso di telecamere reali con pipeline di detection e tracking più robuste;
+    \item uso di LiDAR o radar con modellazione più completa della scena;
+    \item rilevamento automatico degli ostacoli senza dipendere da ipotesi forti sulla loro posizione;
+    \item stima della velocità degli altri veicoli tramite filtri o tracker multi-target;
+    \item gestione esplicita del rumore dei sensori;
+    \item modellazione dell'incertezza nelle misure.
+\end{itemize}
+
+Un'estensione di questo tipo renderebbe il framework più vicino a un contesto applicativo reale e permetterebbe di studiare quanto la qualità della percezione influenzi la robustezza della decisione di sorpasso.
+
+\section{Scenari stradali più complessi}
+
+Gli scenari utilizzati nella tesi sono volutamente controllati e servono a isolare il problema del sorpasso di un ostacolo singolo. In futuro sarebbe utile valutare il sistema in situazioni più articolate, ad esempio:
+
+\begin{itemize}
+    \item strade curve;
+    \item incroci;
+    \item più corsie;
+    \item traffico intenso;
+    \item ostacoli multipli;
+    \item veicoli con comportamenti non costanti;
+    \item condizioni meteo o visibilità ridotta.
+\end{itemize}
+
+In scenari di questo tipo potrebbero emergere limiti non visibili nelle prove attuali, soprattutto nella gestione delle transizioni tra una fase della manovra e la successiva.
+
+\section{Predizione del comportamento degli altri veicoli}
+
+Nel sistema attuale il comportamento degli altri veicoli viene trattato in forma locale e quasi istantanea: si osservano distanza, velocità relativa e, in alcuni casi, trend di avvicinamento. Un'estensione naturale consiste nell'aggiungere un modulo di predizione del comportamento futuro degli altri utenti stradali.
+
+Una tale estensione permetterebbe di distinguere, ad esempio, tra un veicolo posteriore che sta effettivamente cambiando dinamica e un veicolo che appare temporaneamente critico solo per un istante. Analogamente, si potrebbe stimare se un veicolo frontale sulla corsia opposta continuerà a convergere o se si allontanerà, migliorando la qualità della decisione di avvio o di rientro del sorpasso.
+
+\section{Miglioramento della pianificazione della traiettoria}
+
+Nel progetto la traiettoria viene costruita a partire da waypoint e piani locali derivati dalla route. Questa scelta è adeguata allo scopo della tesi, ma lascia spazio a miglioramenti significativi. In particolare, si potrebbero introdurre:
+
+\begin{itemize}
+    \item traiettorie più fluide;
+    \item pianificazione basata su vincoli cinematici;
+    \item pianificazione ottimizzata;
+    \item adattamento della traiettoria alla velocità;
+    \item gestione dinamica del rientro in corsia.
+\end{itemize}
+
+Una pianificazione più evoluta potrebbe ridurre la necessità di euristiche aggiuntive nel controllore, soprattutto nel caso MPC, e rendere il comportamento del veicolo più prevedibile e confortevole.
+
+\section{Estensione del confronto tra controllori}
+
+Il confronto tra PID e MPC sviluppato nella tesi è significativo, ma può essere esteso in diverse direzioni. Alcune possibilità sono:
+
+\begin{itemize}
+    \item test con più velocità iniziali;
+    \item test con più configurazioni di traffico;
+    \item confronto con altri controllori;
+    \item ottimizzazione automatica dei parametri;
+    \item analisi più approfondita del costo computazionale.
+\end{itemize}
+
+Per esempio, un'estensione interessante sarebbe confrontare i due approcci in presenza di disturbi, ritardi sensoriali o modelli di traffico più aggressivi, per capire se il vantaggio qualitativo dell'MPC sulla fluidità diventi anche un vantaggio quantitativo su sicurezza e tracking.
+
+\section{Validazione su veicolo reale}
+
+L'ultimo sviluppo futuro, il più ambizioso, consiste nel trasferire il sistema da simulazione a una piattaforma reale o a un banco prova veicolare. Questo passaggio richiederebbe però di affrontare problemi aggiuntivi, tra cui:
+
+\begin{itemize}
+    \item rumore dei sensori;
+    \item ritardi di comunicazione;
+    \item vincoli fisici del veicolo;
+    \item sicurezza dei test;
+    \item necessità di validazione progressiva.
+\end{itemize}
+
+In particolare, un trasferimento diretto non sarebbe realistico senza una fase intermedia di validazione hardware-in-the-loop o su piattaforme sperimentali a bassa velocità. Tuttavia, l'architettura modulare sviluppata in questa tesi rende possibile immaginare un'evoluzione graduale del lavoro verso contesti sempre più realistici.

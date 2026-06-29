@@ -1,0 +1,106 @@
+\chapter{Framework decisionale}
+
+\section{Obiettivo del framework}
+
+Il framework decisionale sviluppato in questa tesi ha il compito di stabilire quando il veicolo debba restare nella corsia corrente, quando debba attendere e quando possa iniziare o concludere la manovra di sorpasso. Il suo obiettivo non è produrre direttamente il comando di sterzo o di frenata, ma organizzare il comportamento dell'agente in fasi discrete, ciascuna associata a un diverso piano locale e a diverse condizioni di sicurezza.
+
+La scelta di utilizzare una macchina a stati permette di modellare in modo trasparente l'intera evoluzione della manovra: avvicinamento all'ostacolo, fase di attesa, uscita dalla corsia, passaggio nella corsia laterale, rientro e stabilizzazione finale.
+
+\section{Informazioni usate nella decisione}
+
+La decisione si basa su una rappresentazione locale dello scenario costruita a partire dai sensori e dalla mappa. Le informazioni più rilevanti sono:
+
+\begin{itemize}
+    \item la presenza di un ostacolo o di un veicolo bloccante davanti al veicolo ego;
+    \item la distanza frontale misurata dal radar anteriore;
+    \item la velocità relativa di chiusura rispetto all'ostacolo;
+    \item la presenza di un veicolo in arrivo sulla corsia laterale, rilevato dalla camera sinistra;
+    \item la presenza di un veicolo che sopraggiunge da dietro, rilevato dal radar posteriore;
+    \item l'identificativo della corsia corrente e della corsia di origine;
+    \item il tempo trascorso nelle diverse fasi della manovra.
+\end{itemize}
+
+Il framework non esegue una predizione sofisticata multi-agente, ma utilizza regole locali fondate su distanza, \(TTC\), identificativi di corsia e persistenza temporale delle condizioni osservate.
+
+\section{Macchina a stati}
+
+La logica implementata si articola nei seguenti stati:
+
+\begin{itemize}
+    \item \texttt{follow\_lane}: guida normale lungo la route, senza manovra attiva;
+    \item \texttt{waiting\_left}: ostacolo rilevato, sorpasso desiderato ma non ancora autorizzato;
+    \item \texttt{changing\_left}: fase di uscita dalla corsia originale e inserimento nella corsia di sorpasso;
+    \item \texttt{passing}: percorrenza della corsia laterale durante il superamento dell'ostacolo;
+    \item \texttt{changing\_right}: fase di rientro nella corsia originale.
+\end{itemize}
+
+Lo stato iniziale è \texttt{follow\_lane}. Quando il radar anteriore segnala un ostacolo persistente e la corsia corrente risulta bloccata, il sistema passa a \texttt{waiting\_left}. Se le condizioni di sicurezza sono soddisfatte, viene costruito un nuovo piano locale e si entra in \texttt{changing\_left}. Il passaggio a \texttt{passing} avviene quando il veicolo risulta effettivamente entrato nella corsia laterale. Infine, quando la corsia originale viene considerata nuovamente libera e il tempo minimo trascorso nella corsia di sorpasso è sufficiente, il sistema attiva \texttt{changing\_right} e poi torna a \texttt{follow\_lane}.
+
+\section{Attivazione del sorpasso}
+
+Il sorpasso non viene avviato non appena compare un ostacolo. Il framework richiede anzitutto che il blocco sia persistente per un breve intervallo temporale, in modo da evitare attivazioni spurie dovute a misure instabili. Inoltre, la manovra è consentita solo se:
+
+\begin{itemize}
+    \item il veicolo non si trova in un incrocio;
+    \item esiste una corsia sinistra di tipo \texttt{Driving};
+    \item non è presente un veicolo laterale in arrivo dalla sinistra;
+    \item non è presente un veicolo posteriore in rapido avvicinamento, salvo il caso in cui il radar posteriore lo classifichi come in fase di rilascio;
+    \item il margine frontale non è già sceso sotto soglie incompatibili con l'avvio della manovra.
+\end{itemize}
+
+Quando tutte queste condizioni sono soddisfatte, il framework salva il piano residuo della route originale e costruisce un piano locale temporaneo che porta il veicolo nella corsia di sorpasso.
+
+\section{Gestione della fase di attesa}
+
+Lo stato \texttt{waiting\_left} è particolarmente importante, perché rappresenta la fase in cui il sistema ha riconosciuto la necessità del sorpasso ma non ha ancora autorizzato il cambio corsia. In questa fase il veicolo può rallentare o fermarsi in funzione della distanza dall'ostacolo e della velocità relativa.
+
+La frenata non dipende soltanto da una soglia metrica fissa. Il sistema costruisce infatti un profilo di sicurezza frontale che combina:
+
+\begin{itemize}
+    \item distanza minima di mantenimento;
+    \item distanza di reazione;
+    \item distanza di frenata confortevole;
+    \item distanza di emergenza;
+    \item \(TTC\) rispetto all'ostacolo.
+\end{itemize}
+
+Questo profilo permette di differenziare tra una situazione in cui il veicolo può ancora avanzare lentamente e una situazione in cui deve arrestarsi. Nel caso MPC, la fase di attesa è inoltre integrata con un controllo longitudinale dedicato, che permette di modulare meglio la ripartenza quando la corsia torna libera.
+
+\section{Fase di superamento}
+
+Durante \texttt{changing\_left} il veicolo segue il nuovo piano locale costruito per uscire dalla corsia originale. In questa fase il framework continua a monitorare l'ostacolo frontale e l'eventuale comparsa di veicoli laterali critici. Se emerge un rischio immediato, per esempio per presenza di un veicolo in arrivo nella corsia usata per il sorpasso o per rapido avvicinamento all'ostacolo, il sistema può attivare un override di sicurezza e comandare una frenata d'emergenza.
+
+Una volta che il veicolo ha realmente lasciato la corsia di origine, il framework entra nello stato \texttt{passing}. In questo stato l'obiettivo è mantenere il veicolo sufficientemente a lungo nella corsia di sorpasso per superare completamente la sagoma dell'ostacolo, senza iniziare il rientro troppo presto.
+
+\section{Logica di rientro}
+
+Il rientro nella corsia originale non viene attivato immediatamente dopo il cambio corsia iniziale. Il framework impone due condizioni principali:
+
+\begin{itemize}
+    \item il veicolo deve essere rimasto nella corsia di sorpasso per un tempo minimo;
+    \item la corsia originale deve risultare libera per un intervallo di conferma.
+\end{itemize}
+
+La verifica della libertà della corsia di rientro viene svolta filtrando i punti del radar anteriore in modo coerente con la geometria della corsia originale. I punti validi vengono raggruppati in cluster e la corsia viene considerata libera solo se il cluster più vicino è abbastanza lontano oppure se il numero di punti coerenti è insufficiente per considerare reale un ostacolo. Questa scelta riduce la probabilità di bloccare il rientro a causa di eco radar isolate o rumorose.
+
+Quando le condizioni di rientro sono soddisfatte, il framework costruisce un nuovo piano locale e passa allo stato \texttt{changing\_right}. Il ritorno a \texttt{follow\_lane} avviene solo dopo che il veicolo si è nuovamente stabilizzato nella corsia originale.
+
+\section{Fail-safe e override di sicurezza}
+
+Accanto alla logica nominale, il framework include meccanismi di sicurezza che possono intervenire direttamente sul comando finale. Questi meccanismi hanno priorità sul controllore e servono a gestire situazioni non sicure o non previste in modo sufficientemente robusto dal piano attivo. Tra gli override implementati rientrano:
+
+\begin{itemize}
+    \item frenata automatica per ostacolo frontale troppo vicino;
+    \item frenata d'emergenza in caso di \(TTC\) troppo basso;
+    \item blocco o rinvio dell'avvio del sorpasso in presenza di veicolo posteriore in avvicinamento;
+    \item interruzione della fase di superamento in presenza di veicolo laterale o frontale critico;
+    \item cooldown temporale dopo il completamento della manovra, per evitare riattivazioni immediate.
+\end{itemize}
+
+Questi meccanismi non sostituiscono la macchina a stati, ma la completano, offrendo uno strato di protezione locale orientato alla sicurezza.
+
+\section{Considerazioni sul framework}
+
+Il framework sviluppato è volutamente semplice, interpretabile e modulare. Non usa una pianificazione globale ottimizzata né un modello complesso del traffico, ma si basa su regole locali, stati discreti e soglie dinamiche facilmente leggibili. Questo approccio è adatto al contesto della tesi perché rende chiaro il contributo del livello decisionale e permette di confrontare in modo trasparente il comportamento dei due controllori.
+
+Il limite principale è che la robustezza del sistema dipende dalla qualità della percezione locale e dalla taratura delle soglie. Tuttavia, proprio questa caratteristica rende il framework una buona base sperimentale per studiare separatamente il ruolo della decisione e quello del controllo nella manovra di superamento ostacoli.
